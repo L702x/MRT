@@ -4,10 +4,11 @@
 // What it does:
 //  1. Triages live infection signs (staging dirs, named pipes, malicious processes).
 //  2. Finds Stage-1 droppers (malicious Minecraft JARs / EXE-DLL variants) in the
-//     places SilentNet actually lives, using rules/silentnet.yar (external `yara`
+//     places SilentNet actually lives, using embedded rules/*.yar (external `yara`
 //     binary when present, otherwise an embedded engine that loads the same .yar
 //     literals + ZIP-structure scoring, which is required because padded Stage-1
-//     class strings are XOR-encrypted at rest).
+//     class strings are XOR-encrypted at rest). On-disk rules/*.yar next to the
+//     exe still load on top and take precedence for both paths.
 //     Donki (Module.jar) is covered the same way via rules/donki.yar:
 //     ZIP-entry-name scoring (JNIC-resistant) + content-literal scoring for
 //     extracted classes / native libs / memory.
@@ -38,6 +39,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"crypto/sha256"
+	"embed"
 	"encoding/csv"
 	"encoding/hex"
 	"flag"
@@ -108,7 +110,7 @@ var (
 	fExtraPath    = flag.String("extra-path", "", "Comma-separated extra paths to scan (e.g. for testing against sample dirs)")
 	fDelete       = flag.Bool("delete", false, "Permanently delete droppers instead of quarantining (staging dir is always deleted)")
 	fNoHarden     = flag.Bool("no-harden", false, "Skip hosts/firewall hardening")
-	fYaraPath     = flag.String("yara-rules", "", "Single .yar file override (default: load every rules/*.yar next to the exe)")
+	fYaraPath     = flag.String("yara-rules", "", "Single .yar file override (default: embedded rules plus every rules/*.yar next to the exe)")
 	fRoots        = flag.String("roots", "", "Comma-separated scan roots override (default: common places). Use for fast targeted scans, e.g. --roots \"C:\\samples\"")
 	fAllowSampleDir = flag.Bool("allow-sample-dir", false, "Allow quarantine/delete inside the C:\\MALWARE research collection (default: refuse; scan-only still works)")
 	fListLaunchers = flag.Bool("list-launchers", false, "List known game launchers and which ones are installed, then exit") 
@@ -218,10 +220,20 @@ func stagingDir() string {
 
 // ---------------------------------------------------------------------------
 // YARA rules handling: prefer external `yara`, else embedded engine.
-// The embedded engine loads literals out of the same .yar file so both paths
-// enforce the same rules. ZIP-structure scoring handles the XOR-encrypted
-// (padded) Stage-1 classes where plaintext C2 strings are invisible.
+// Rules are embedded in the binary via go:embed so the tool works standalone;
+// on-disk rules/*.yar next to the exe (or --yara-rules) still load on top and
+// take precedence. The embedded engine loads literals out of the same .yar
+// content so both paths enforce the same rules. ZIP-structure scoring handles
+// the XOR-encrypted (padded) Stage-1 classes where plaintext C2 strings are
+// invisible.
 // ---------------------------------------------------------------------------
+
+//go:embed rules/*.yar
+var embeddedYaraFS embed.FS
+
+// embeddedYaraTempDir holds materialized copies of the embedded .yar files so
+// the external `yara` binary (which needs real file paths) can confirm hits.
+var embeddedYaraTempDir string
 
 var embeddedCleanMarkers = []string{
 	"NtProfileIndex", "LOCALAPPDATA", "_spawn.log", "-restarted",
@@ -274,13 +286,99 @@ func yaraRulesFiles() []string {
 	return out
 }
 
+func embeddedYaraNames() []string {
+	entries, err := embeddedYaraFS.ReadDir("rules")
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".yar") {
+			continue
+		}
+		out = append(out, e.Name())
+	}
+	sort.Strings(out)
+	return out
+}
+
+func appendYaraLiterals(data []byte, seen map[string]bool) int {
+	n := 0
+	for _, m := range reYaraStringDef.FindAllSubmatch(data, -1) {
+		lit := string(m[1])
+		// Unescape \" and \\ minimally.
+		lit = strings.ReplaceAll(lit, `\"`, `"`)
+		lit = strings.ReplaceAll(lit, `\\`, `\`)
+		if len(lit) < 4 || len(lit) > 200 {
+			continue
+		}
+		if !seen[lit] {
+			seen[lit] = true
+			yaraLiterals = append(yaraLiterals, lit)
+			n++
+		}
+	}
+	return n
+}
+
+// loadEmbeddedYara parses literals from the go:embed'd rules/*.yar and
+// materializes them to a temp dir so the external `yara` binary can use real
+// file paths for per-family confirmation. Returns number of embedded files.
+func loadEmbeddedYara(seen map[string]bool) int {
+	names := embeddedYaraNames()
+	if len(names) == 0 {
+		return 0
+	}
+	// Materialize once so external yara gets stable paths for this run.
+	if embeddedYaraTempDir == "" {
+		dir, err := os.MkdirTemp("", "mrt-yara-*")
+		if err != nil {
+			warnf("cannot create temp dir for embedded yara rules: %v", err)
+			return 0
+		}
+		embeddedYaraTempDir = dir
+	}
+	loaded := 0
+	for _, name := range names {
+		data, err := embeddedYaraFS.ReadFile("rules/" + name)
+		if err != nil {
+			warnf("cannot read embedded yara rules %s: %v (skipping)", name, err)
+			continue
+		}
+		base := strings.ToLower(strings.TrimSuffix(name, filepath.Ext(name)))
+		tmpPath := filepath.Join(embeddedYaraTempDir, name)
+		if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+			warnf("cannot materialize embedded yara rules %s: %v", name, err)
+			// Still parse literals; only external confirmation loses this family.
+		} else if _, ok := yaraRulesByFamily[base]; !ok {
+			yaraRulesByFamily[base] = tmpPath
+		}
+		n := appendYaraLiterals(data, seen)
+		vlogf("[yara] %d literals from embedded rules/%s", n, name)
+		loaded++
+	}
+	return loaded
+}
+
 func loadYaraLiterals() {
-	files := yaraRulesFiles()
-	if len(files) == 0 {
-		vlogf("no .yar files found next to exe; using embedded literals")
+	seen := map[string]bool{}
+	// Single-file override keeps its historical exclusive semantics.
+	if *fYaraPath != "" {
+		data, err := os.ReadFile(*fYaraPath)
+		if err != nil {
+			warnf("cannot read yara rules %s: %v (skipping)", *fYaraPath, err)
+			return
+		}
+		base := strings.ToLower(strings.TrimSuffix(filepath.Base(*fYaraPath), filepath.Ext(*fYaraPath)))
+		yaraRulesByFamily[base] = *fYaraPath
+		n := appendYaraLiterals(data, seen)
+		logf("[yara] loaded %d string literals from 1 rule file(s) (--yara-rules override)", len(yaraLiterals))
+		vlogf("[yara] %d literals from %s", n, *fYaraPath)
 		return
 	}
-	seen := map[string]bool{}
+	nEmbedded := loadEmbeddedYara(seen)
+	files := yaraRulesFiles()
+	nDisk := 0
 	for _, path := range files {
 		data, err := os.ReadFile(path)
 		if err != nil {
@@ -288,27 +386,18 @@ func loadYaraLiterals() {
 			continue
 		}
 		base := strings.ToLower(strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)))
-		if _, ok := yaraRulesByFamily[base]; !ok {
-			yaraRulesByFamily[base] = path
-		}
-		n := 0
-		for _, m := range reYaraStringDef.FindAllSubmatch(data, -1) {
-			lit := string(m[1])
-			// Unescape \" and \\ minimally.
-			lit = strings.ReplaceAll(lit, `\"`, `"`)
-			lit = strings.ReplaceAll(lit, `\\`, `\`)
-			if len(lit) < 4 || len(lit) > 200 {
-				continue
-			}
-			if !seen[lit] {
-				seen[lit] = true
-				yaraLiterals = append(yaraLiterals, lit)
-				n++
-			}
-		}
+		// On-disk files take precedence over the embedded copy for external
+		// confirmation so local rule edits apply without rebuilding.
+		yaraRulesByFamily[base] = path
+		n := appendYaraLiterals(data, seen)
 		vlogf("[yara] %d literals from %s", n, path)
+		nDisk++
 	}
-	logf("[yara] loaded %d string literals from %d rule file(s)", len(yaraLiterals), len(files))
+	if nEmbedded+nDisk == 0 {
+		vlogf("no embedded or on-disk .yar rules found; using built-in literals")
+		return
+	}
+	logf("[yara] loaded %d string literals from %d embedded + %d on-disk rule file(s)", len(yaraLiterals), nEmbedded, nDisk)
 }
 
 func externalYara() string {
@@ -1944,7 +2033,9 @@ func collectCandidates(roots []string) []string {
 
 func scanFiles(files []string) []finding {
 	yaraBin := externalYara()
-	nRules := len(yaraRulesFiles())
+	// loadYaraLiterals() runs in main() before the hunt, so yaraRulesByFamily
+	// already counts embedded (materialized to temp) + on-disk rule files.
+	nRules := len(yaraRulesByFamily)
 	if yaraBin != "" && nRules > 0 {
 		logf("[yara] external binary found (%s); internal scores confirmed against %d rule file(s)", yaraBin, nRules)
 	} else if nRules > 0 {
