@@ -20,6 +20,9 @@ It is made because of official and known tools lack the ability to remove uncomm
 
 # FAQ
 Why should I run it as administrator?
+
 > So the tool can remove left over registry keys and such
+
 Is it safe?
+
 > Yes it's opensource
