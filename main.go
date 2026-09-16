@@ -1,4 +1,4 @@
-// MRT - multi-family malware removal tool.
+// MRT - Made by L702x/Krotten/NotPetya (same person)
 package main
 
 import (
@@ -22,7 +22,7 @@ import (
 	"time"
 )
 
-const toolVersion = "1.2.0"
+const toolVersion = "1.4.0"
 
 var (
 	c2Domains = []string{
