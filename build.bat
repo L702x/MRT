@@ -1,1 +1,1 @@
-CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -v -x -o mrt.exe .
+go build -ldflags="-s -w" -trimpath -v -x -o mrt.exe .
