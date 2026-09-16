@@ -1,12 +1,4 @@
-/*
-  WeedHack / GriftClient / Majanito MaaS — Stage-1 Fabric mod loader
-  Operator pivots (survive rebrands + C2 rotation):
-    ETH contract 0x1280a841Fbc1F883365d3C83122260E0b2995B74, selector 0xce6d41de
-    URIs /api/delivery/handler + /files/jar/module, stage-2 dev.majanito.Main
-  Samples: KrLoader-1.0.jar (JNIC), Krypton-1.0.0.jar (pure-Java), Prestige-1.21.x.jar
-  References: C:\MALWARE\Papers\Discord Malware\{krloader,krypton,prestige}_report.md
-              C:\MALWARE\Papers\weedhack.md / weedhack.txt
-*/
+/* MRT - WeedHack rules. */
 
 rule weedhack_stage1_jar {
   meta:
@@ -16,7 +8,6 @@ rule weedhack_stage1_jar {
 
   strings:
     $zip = { 50 4B 03 04 }
-    // Structural anchors (ZIP central directory — visible despite string encryption)
     $jnic_dir   = /native\/[0-9a-f]{16,}\// ascii
     $jnic_lib   = "dev/jnic/" ascii
     $silent_blob = "assets/thread_silent.dat" ascii
@@ -26,7 +17,6 @@ rule weedhack_stage1_jar {
     $mod_prest  = "\"id\" : \"prestigemod\"" ascii
     $mod_rypt   = "\"id\" : \"rypton\"" ascii
     $licensekey = "licenseKey" ascii
-    // Operator pivots (plaintext in pure-Java builds, encrypted in JNIC builds)
     $contract = "0x1280a841Fbc1F883365d3C83122260E0b2995B74" ascii nocase
     $exfil    = "/api/delivery/handler" ascii
     $module   = "/files/jar/module" ascii
@@ -44,11 +34,9 @@ rule weedhack_stage1_jar {
   condition:
     $zip at 0 and filesize < 40MB and
     (
-      // Structural conviction: builder-specific layout
       ($jnic_dir and 1 of ($mod_kr, $mod_loader, $tmpdll)) or
       ($silent_blob and $mod_prest) or
       ($mod_rypt) or
-      // Operator pivots: any two survive rebrands
       (2 of ($contract, $exfil, $module, $stage2, $init, $guid1, $guid2, $guid3))
     )
 }

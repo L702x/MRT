@@ -1,10 +1,4 @@
-/*
-  WXSGrabber — Fabric mod stealer + PowerShell RAT (Firebase C2)
-  Internal sample name: "Krypton Client.jar" (distinct from WeedHack Krypton-1.0.0.jar!)
-  Persistence: %APPDATA%\.sys-cache\ + HKCU Run FabricRuntimeInit/FabricListenerInit
-  C2: https://api.x-grabber.com (header X-WXS-Build-Token), Firebase wxsgrabber-default-rtdb
-  Reference: C:\MALWARE\Papers\Discord Malware\REPORT_WXSGrabber.md
-*/
+/* MRT - WXSGrabber rules. */
 
 rule wxsgrabber_fabric_mod {
   meta:
@@ -14,13 +8,11 @@ rule wxsgrabber_fabric_mod {
 
   strings:
     $zip = { 50 4B 03 04 }
-    // Structural anchors (ZIP central directory)
     $lic    = "LICENSE_wxsgrabber-mod" ascii
     $modid  = "\"id\":\"my-mod\"" ascii
     $modid2 = "\"id\" : \"my-mod\"" ascii
     $modid3 = "\"id\":\"my-mod\"" ascii
     $impl   = "net.fabricmc.core.impl." ascii
-    // Persistence + C2 markers (XOR-encoded at rest in some builds; plaintext in others)
     $persist = "wxsgrabber-persistence" ascii wide
     $hdr     = "X-WXS-Build-Token" ascii wide
     $run1    = "FabricRuntimeInit" ascii wide

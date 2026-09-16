@@ -26,3 +26,11 @@ Why should I run it as administrator?
 Is it safe?
 
 > Yes it's opensource
+
+What does it leave behind?
+
+> Only a quarantine directory at %LOCALAPPDATA%\MRT and firewall rules to block outbound rules to known C2 servers. Aswell as %TEMP%\mrt-yara-* and edits of C:\Windows\System32\drivers\etc\hosts
+
+Where is 1.0 and 1.1?
+
+> Gone lol (old builds not worth pushing to the github)

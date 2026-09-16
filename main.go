@@ -1,38 +1,4 @@
-// SilentNet remover — defensive cleanup tool for the SilentNet MaaS infostealer,
-// extended to multi-family MRT (SilentNet, WeedHack/Majanito, WXSGrabber, Donki).
-//
-// What it does:
-//  1. Triages live infection signs (staging dirs, named pipes, malicious processes).
-//  2. Finds Stage-1 droppers (malicious Minecraft JARs / EXE-DLL variants) in the
-//     places SilentNet actually lives, using embedded rules/*.yar (external `yara`
-//     binary when present, otherwise an embedded engine that loads the same .yar
-//     literals + ZIP-structure scoring, which is required because padded Stage-1
-//     class strings are XOR-encrypted at rest). On-disk rules/*.yar next to the
-//     exe still load on top and take precedence for both paths.
-//     Donki (Module.jar) is covered the same way via rules/donki.yar:
-//     ZIP-entry-name scoring (JNIC-resistant) + content-literal scoring for
-//     extracted classes / native libs / memory.
-//  3. Kills active stealer processes, quarantines droppers, deletes the
-//     NtProfileIndex staging bundle, Donki SecurityUpdates + donki_staging
-//     bundles, spawn logs, registry mutex/Run values,
-//     scheduled tasks and Startup droppings.
-//  4. Hardens the host (hosts-file + firewall blocks for static C2s, DNS flush).
-//     Donki's live C2 is blockchain-resolved (no static hostname) so hardening
-//     only notes it — the resolved host must come from sandbox/RPC lookup.
-//  5. Verifies the wipe and prints the credential-rotation checklist, because
-//     wiping the box does NOT revoke what was already exfiltrated.
-//
-// Static-analysis sources (never executed):
-//  - C:\MALWARE\Discord\silentnet (15 padded JAR droppers)
-//  - C:\MALWARE\Papers\silentnet-main\silentnet-main (30 recovered stage-2 modules + IOCs)
-//  - C:\MALWARE\Papers\doomed (sample no padding.jar + Launcher/Stealer stage-1 source)
-//  - C:\MALWARE\Discord\silentnet incompetence\payload_decrypted (decrypted Python bundle + AppHost)
-//  - C:\MALWARE\Discord\Donki (Module.jar 6.77MB SHA256 25B2E5E5... + Module_writeup.md + DonkiStealer.yar)
-//
-// Safety: droppers are QUARANTINED by default, never silently deleted.
-// Staging dirs %LOCALAPPDATA%\Microsoft\Windows\NtProfileIndex (SilentNet),
-// %APPDATA%\Microsoft\SecurityUpdates + %TEMP%\donki_staging (Donki) are
-// malware-only and are deleted outright. Run with --dry-run first.
+// MRT - multi-family malware removal tool.
 package main
 
 import (
@@ -58,47 +24,35 @@ import (
 
 const toolVersion = "1.2.0"
 
-// ---------------------------------------------------------------------------
-// IOCs (from silentnet-main README + doomed decrypt results + payload bundle
-// + C:\MALWARE\Discord\Donki\Module_writeup.md static analysis of Module.jar)
-// ---------------------------------------------------------------------------
-
 var (
 	c2Domains = []string{
-		"thisisafalsepositive.st", // active C2 (blockchain-resolved)
-		"sltnnt.ru",               // previous C2
-		"silentnet.st",            // MaaS operator portal
+		"thisisafalsepositive.st",
+		"sltnnt.ru",
+		"silentnet.st",
 	}
 	c2IPs = []string{
-		"185.178.208.191", // victim C2
-		"185.178.208.165", // portal
+		"185.178.208.191",
+		"185.178.208.165",
 	}
 	contractAddress = "0x9c0a507300fd902787bb193d80fca5ce6e1bff9a"
 	operatorWallet  = "0x6767c6496541b530a5d1d0eb9b80bd5c7bf56767"
-	// WeedHack/Majanito operator pivots (survive rebrands + C2 rotation).
+
 	weedhackContract = "0x1280a841Fbc1F883365d3C83122260E0b2995B74"
 	getDomainSel    = "ce6d41de"
 	fernetKey       = "74af664f79d1ef1436a4bf301788c7eb207570de60034b19d76df8e7aefc69b7"
-	// Donki (Module.jar) on-chain C2 anchor. Live hostname is resolved at
-	// runtime via eth_call to this contract — it is NOT hardcoded, so there
-	// is no static Donki hostname/IP to block (see hardenHost).
+
 	donkiContract   = "0x9044f5762e43b23ba91d124b51a045f1b51da652"
 	donkiSelector   = "0x1f1bd692"
 	donkiStage2Main = "dev.majanito.security.Main"
-	donkiModuleSHA256 = "25b2e5e52c023efb7d83201a5fd0edfeca1642ef98cab7b8069f45ee6fd7269b" // Module.jar, 6770148 B
+	donkiModuleSHA256 = "25b2e5e52c023efb7d83201a5fd0edfeca1642ef98cab7b8069f45ee6fd7269b"
 
 	pipeName = `\\.\pipe\NtProfileSync`
-	donkiPipePrefix = `\\.\pipe\abe_decrypt_` // ABE bypass pipes are abe_decrypt_<ms>_<attempt>
+	donkiPipePrefix = `\\.\pipe\abe_decrypt_`
 
-	// Known-good hashes of SilentNet-specific bundle files (not generic Python).
-	licGithubSHA256Prefix = "6d489af6292662d9e36d34ce49423784" // LICENSE_github, 7047 B
-	iconSHA256Prefix      = "c888e51cbbfd3cd10a08cc48997a0c68" // assets/package/icon.png, 252 B
+	licGithubSHA256Prefix = "6d489af6292662d9e36d34ce49423784"
+	iconSHA256Prefix      = "c888e51cbbfd3cd10a08cc48997a0c68"
 	mainPySHA256          = "bc87ec291523785fd9f8b1925e92dbe5aa71af4a9dd631c794fc14efd9e5afb1"
 )
-
-// ---------------------------------------------------------------------------
-// CLI flags
-// ---------------------------------------------------------------------------
 
 var (
 	fScanOnly     = flag.Bool("scan-only", false, "Only scan and report, do not remove anything")
@@ -106,19 +60,15 @@ var (
 	fYes          = flag.Bool("yes", false, "Skip confirmation prompt (required for non-interactive removal)")
 	fDryRun       = flag.Bool("dry-run", false, "Print what would be done without changing anything")
 	fVerbose      = flag.Bool("verbose", false, "Verbose output (per-file scores, skipped dirs)")
-	fQuarantine   = flag.String("quarantine-dir", "", "Quarantine directory (default %LOCALAPPDATA%\\SilentNetRemover\\quarantine)")
+	fQuarantine   = flag.String("quarantine-dir", "", "Quarantine directory (default %LOCALAPPDATA%\\MRT\\quarantine)")
 	fExtraPath    = flag.String("extra-path", "", "Comma-separated extra paths to scan (e.g. for testing against sample dirs)")
 	fDelete       = flag.Bool("delete", false, "Permanently delete droppers instead of quarantining (staging dir is always deleted)")
 	fNoHarden     = flag.Bool("no-harden", false, "Skip hosts/firewall hardening")
 	fYaraPath     = flag.String("yara-rules", "", "Single .yar file override (default: embedded rules plus every rules/*.yar next to the exe)")
 	fRoots        = flag.String("roots", "", "Comma-separated scan roots override (default: common places). Use for fast targeted scans, e.g. --roots \"C:\\samples\"")
 	fAllowSampleDir = flag.Bool("allow-sample-dir", false, "Allow quarantine/delete inside the C:\\MALWARE research collection (default: refuse; scan-only still works)")
-	fListLaunchers = flag.Bool("list-launchers", false, "List known game launchers and which ones are installed, then exit") 
+	fListLaunchers = flag.Bool("list-launchers", false, "List known game launchers and which ones are installed, then exit")
 )
-
-// ---------------------------------------------------------------------------
-// Small helpers
-// ---------------------------------------------------------------------------
 
 func logf(format string, a ...any) { fmt.Printf(format+"\n", a...) }
 
@@ -148,8 +98,6 @@ func expandEnvList(paths ...string) []string {
 	return out
 }
 
-// expandPathEnv expands both Windows %VAR% and Go $VAR/${VAR} syntax.
-// (os.ExpandEnv alone does not understand %VAR%.)
 var reWinEnv = regexp.MustCompile(`%([A-Za-z_][A-Za-z0-9_]*)%`)
 
 func expandPathEnv(p string) string {
@@ -194,9 +142,7 @@ func runCmd(name string, args ...string) (string, int) {
 
 func isAdmin() bool {
 	if runtime.GOOS != "windows" {
-		// Non-Windows branch exists only for local dev/testing (go vet,
-		// targeted --roots scans). Everything this tool removes — registry,
-		// scheduled tasks, WMIC/CIM process listing, netsh — is Windows-only.
+
 		return os.Geteuid() == 0
 	}
 	_, code := runCmd("net", "session")
@@ -211,28 +157,16 @@ func quarantineDir() string {
 	if base == "" {
 		base = os.TempDir()
 	}
-	return filepath.Join(base, "SilentNetRemover", "quarantine")
+	return filepath.Join(base, "MRT", "quarantine")
 }
 
 func stagingDir() string {
 	return filepath.Join(os.Getenv("LOCALAPPDATA"), "Microsoft", "Windows", "NtProfileIndex")
 }
 
-// ---------------------------------------------------------------------------
-// YARA rules handling: prefer external `yara`, else embedded engine.
-// Rules are embedded in the binary via go:embed so the tool works standalone;
-// on-disk rules/*.yar next to the exe (or --yara-rules) still load on top and
-// take precedence. The embedded engine loads literals out of the same .yar
-// content so both paths enforce the same rules. ZIP-structure scoring handles
-// the XOR-encrypted (padded) Stage-1 classes where plaintext C2 strings are
-// invisible.
-// ---------------------------------------------------------------------------
-
 //go:embed rules/*.yar
 var embeddedYaraFS embed.FS
 
-// embeddedYaraTempDir holds materialized copies of the embedded .yar files so
-// the external `yara` binary (which needs real file paths) can confirm hits.
 var embeddedYaraTempDir string
 
 var embeddedCleanMarkers = []string{
@@ -251,9 +185,6 @@ var embeddedStage2Markers = []string{
 	fernetKey, "x-cdn-origin-verify", "trusted-upstream",
 }
 
-// yaraLiterals are extra raw literals parsed from the rules/*.yar files.
-// yaraRulesByFamily maps a family key (silentnet/weedhack/wxsgrabber/donki) to its
-// .yar file for external-`yara` confirmation.
 var yaraLiterals []string
 var yaraRulesByFamily = map[string]string{}
 
@@ -306,7 +237,7 @@ func appendYaraLiterals(data []byte, seen map[string]bool) int {
 	n := 0
 	for _, m := range reYaraStringDef.FindAllSubmatch(data, -1) {
 		lit := string(m[1])
-		// Unescape \" and \\ minimally.
+
 		lit = strings.ReplaceAll(lit, `\"`, `"`)
 		lit = strings.ReplaceAll(lit, `\\`, `\`)
 		if len(lit) < 4 || len(lit) > 200 {
@@ -321,15 +252,12 @@ func appendYaraLiterals(data []byte, seen map[string]bool) int {
 	return n
 }
 
-// loadEmbeddedYara parses literals from the go:embed'd rules/*.yar and
-// materializes them to a temp dir so the external `yara` binary can use real
-// file paths for per-family confirmation. Returns number of embedded files.
 func loadEmbeddedYara(seen map[string]bool) int {
 	names := embeddedYaraNames()
 	if len(names) == 0 {
 		return 0
 	}
-	// Materialize once so external yara gets stable paths for this run.
+
 	if embeddedYaraTempDir == "" {
 		dir, err := os.MkdirTemp("", "mrt-yara-*")
 		if err != nil {
@@ -349,7 +277,7 @@ func loadEmbeddedYara(seen map[string]bool) int {
 		tmpPath := filepath.Join(embeddedYaraTempDir, name)
 		if err := os.WriteFile(tmpPath, data, 0644); err != nil {
 			warnf("cannot materialize embedded yara rules %s: %v", name, err)
-			// Still parse literals; only external confirmation loses this family.
+
 		} else if _, ok := yaraRulesByFamily[base]; !ok {
 			yaraRulesByFamily[base] = tmpPath
 		}
@@ -362,7 +290,7 @@ func loadEmbeddedYara(seen map[string]bool) int {
 
 func loadYaraLiterals() {
 	seen := map[string]bool{}
-	// Single-file override keeps its historical exclusive semantics.
+
 	if *fYaraPath != "" {
 		data, err := os.ReadFile(*fYaraPath)
 		if err != nil {
@@ -386,8 +314,7 @@ func loadYaraLiterals() {
 			continue
 		}
 		base := strings.ToLower(strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)))
-		// On-disk files take precedence over the embedded copy for external
-		// confirmation so local rule edits apply without rebuilding.
+
 		yaraRulesByFamily[base] = path
 		n := appendYaraLiterals(data, seen)
 		vlogf("[yara] %d literals from %s", n, path)
@@ -408,7 +335,6 @@ func externalYara() string {
 	return p
 }
 
-// confirmWithExternalYara runs `yara <rules> <file>` and returns matched rule names.
 func confirmWithExternalYara(yaraBin, rules, file string) []string {
 	out, code := runCmd(yaraBin, rules, file)
 	if code != 0 {
@@ -428,26 +354,19 @@ func confirmWithExternalYara(yaraBin, rules, file string) []string {
 	return names
 }
 
-// ---------------------------------------------------------------------------
-// Scoring
-// ---------------------------------------------------------------------------
-
 type finding struct {
 	Path      string
-	Kind      string // "jar-dropper", "jar-weedhack", "jar-wxsgrabber", "jar-donki", "exe-variant", "stage2-file", "hash-destructive", "hacktool", "known-sample"
-	Family    string // "silentnet", "weedhack", "wxsgrabber", "donki", "destructive", "hacktool", "known-sample"
+	Kind      string
+	Family    string
 	Score     int
-	Verdict   string // "CONFIRMED", "SUSPICIOUS", "clean"
+	Verdict   string
 	Reasons   []string
 	SHA256    string
 	Size      int64
 	YaraHits  []string
-	YaraRules string // per-family .yar file for external confirmation
+	YaraRules string
 }
 
-// isSampleCollection reports whether a path lives inside the C:\MALWARE
-// research collection. Removal there is refused by default so a wide sweep
-// can never eat the sample library; --scan-only validation still works.
 func isSampleCollection(p string) bool {
 	up := strings.ToUpper(filepath.Clean(p))
 	return up == `C:\MALWARE` || strings.HasPrefix(up, `C:\MALWARE\`)
@@ -455,7 +374,6 @@ func isSampleCollection(p string) bool {
 
 var reAssetBlob = regexp.MustCompile(`^assets/[a-z]{8}\.(bin|cache|dat|cfg|png)$`)
 
-// scoreJar inspects a ZIP/JAR without executing anything.
 func scoreJar(path string) finding {
 	f := finding{Path: path, Kind: "jar-dropper", Family: "silentnet", Verdict: "clean", YaraRules: yaraRulesByFamily["silentnet"]}
 	st, err := os.Stat(path)
@@ -520,7 +438,7 @@ func scoreJar(path string) finding {
 			largeBlob = name
 			largeBlobSize = e.UncompressedSize64
 		}
-		// Hash the two known-good SilentNet files when present.
+
 		if (name == "LICENSE_github" || name == "assets/package/icon.png") && e.UncompressedSize64 < 1<<20 {
 			if rc, err := e.Open(); err == nil {
 				data, _ := io.ReadAll(io.LimitReader(rc, 1<<20))
@@ -534,7 +452,7 @@ func scoreJar(path string) finding {
 				}
 			}
 		}
-		// Scan small class files for JDK-API triple + plaintext markers.
+
 		if strings.HasSuffix(name, ".class") && e.UncompressedSize64 < 2<<20 {
 			if rc, err := e.Open(); err == nil {
 				data, _ := io.ReadAll(io.LimitReader(rc, 2<<20))
@@ -560,9 +478,7 @@ func scoreJar(path string) finding {
 		score += 1
 		reasons = append(reasons, "LICENSE_github present")
 	}
-	// Structural anchors separate SilentNet from big legit jars (spigot et al.)
-	// that shade com/github deps and use normal JDK APIs. Without at least one
-	// anchor, JDK/plaintext coincidences (getDomain, java.home) must not fire.
+
 	structAnchors := 0
 	if hasLic {
 		structAnchors++
@@ -653,15 +569,6 @@ func strconv_k(s string) string {
 	}
 	return s
 }
-
-// ---------------------------------------------------------------------------
-// WeedHack / Majanito MaaS Stage-1 scorer.
-// Operator pivots: ETH 0x1280a841..., URIs /api/delivery/handler +
-// /files/jar/module, dev.majanito.Main / initializeWeedhack, JNIC native/
-// dirs, assets/thread_silent.dat, fabric ids krloader/loaderclient/
-// prestigemod/rypton. Pure-Java builds keep pivots plaintext; JNIC builds
-// hide them, leaving only ZIP-structure anchors (which never occur legit).
-// ---------------------------------------------------------------------------
 
 var weedhackFabricIDs = []string{`"krloader"`, `"loaderclient"`, `"prestigemod"`, `"rypton"`}
 
@@ -755,8 +662,7 @@ func scoreWeedHackJar(path string) finding {
 		score += 1
 		reasons = append(reasons, "cfg.json buyer-UUID file")
 	}
-	// Non-ASCII (Greek-letter) entrypoint/Main-Class: Krypton-style mangling.
-	// Legit mod entrypoints are plain ASCII package paths.
+
 	if hasNonASCIIEntrypoint(fabricData) {
 		score += 2
 		reasons = append(reasons, "non-ASCII (mangled) Fabric entrypoint")
@@ -823,8 +729,6 @@ func scoreWeedHackJar(path string) finding {
 		reasons = append(reasons, "support markers: "+strings.Join(names, ", "))
 	}
 
-	// Anti-FP gate: without a builder anchor (or 2+ operator pivots that
-	// never occur in legit code), generic strings must not fire.
 	if anchors == 0 && len(strongHits) < 2 {
 		f.Score = 0
 		f.Verdict = "clean"
@@ -841,8 +745,7 @@ func scoreWeedHackJar(path string) finding {
 	default:
 		f.Verdict = "clean"
 	}
-	// Conviction floor: 2+ operator-unique pivots convict on their own, even
-	// without structural anchors. getText is excluded — too generic alone.
+
 	if f.Verdict != "CONFIRMED" {
 		convict := 0
 		for k := range strongHits {
@@ -858,11 +761,6 @@ func scoreWeedHackJar(path string) finding {
 	return f
 }
 
-// hasNonASCIIEntrypoint reports entrypoint-like values containing non-ASCII
-// runes (WeedHack Krypton hides classes behind Greek identifiers).
-
-// hasNonASCIIManifestMainClass reports a manifest Main-Class value with
-// non-ASCII runes (WeedHack Krypton names its Main-Class in Greek letters).
 func hasNonASCIIManifestMainClass(zr *zip.ReadCloser) bool {
 	for _, e := range zr.File {
 		if e.Name != "META-INF/MANIFEST.MF" {
@@ -888,14 +786,12 @@ func hasNonASCIIManifestMainClass(zr *zip.ReadCloser) bool {
 	return false
 }
 
-// hasNonASCIIEntrypoint reports entrypoint values containing non-ASCII runes
-// (WeedHack Krypton hides classes behind Greek identifiers).
 func hasNonASCIIEntrypoint(fabricData []byte) bool {
 	if len(fabricData) == 0 {
 		return false
 	}
 	s := string(fabricData)
-	// Look at the entrypoints block only.
+
 	idx := strings.Index(s, "entrypoints")
 	if idx < 0 {
 		return false
@@ -910,13 +806,6 @@ func hasNonASCIIEntrypoint(fabricData []byte) bool {
 	}
 	return false
 }
-
-// ---------------------------------------------------------------------------
-// WXSGrabber scorer. Anchors: LICENSE_wxsgrabber-mod (unique filename),
-// net.fabricmc.core.impl entrypoint (masquerades as Fabric internals — no
-// legit mod does this). NOTE: fabric id "my-mod" is the Fabric template
-// default, so it scores almost nothing on its own.
-// ---------------------------------------------------------------------------
 
 var wxsStrong = []string{
 	"wxsgrabber-persistence",
@@ -1077,8 +966,7 @@ func scoreWXSJar(path string) finding {
 	default:
 		f.Verdict = "clean"
 	}
-	// Conviction floor: 2+ WXS-unique pivots convict on their own.
-	// Bare "firebasedatabase" is excluded — legit apps use Firebase.
+
 	if f.Verdict != "CONFIRMED" {
 		convict := 0
 		for k := range strongHits {
@@ -1093,19 +981,6 @@ func scoreWXSJar(path string) finding {
 	}
 	return f
 }
-
-// ---------------------------------------------------------------------------
-// Donki scorer (Module.jar, com/example infostealer + ABE bypass).
-// Anchors: com/example entry names (JNIC preserves them — it only rewrites
-// method bodies and adds native libs), manifest Main-Class com.example.Main,
-// querz/JNA/okhttp lib combo. Content pivots: on-chain contract 0x9044f5…,
-// /api/receive + /files/jar/security + /api/static/index.js, Initializing
-// Donki / donki_staging / SecurityManager.jar / dev.majanito.security.Main /
-// abe_decrypt_ / app_bound_encrypted_key / donkiFileInfos / X-Tracking-ID.
-// NOTE: bare com/example/Main.class is a Java-tutorial default — it scores
-// almost nothing without stealer entries or operator pivots.
-// Reference: C:\MALWARE\Discord\Donki\Module_writeup.md + rules/donki.yar.
-// ---------------------------------------------------------------------------
 
 var donkiEntries = []string{
 	"com/example/Main.class",
@@ -1130,7 +1005,6 @@ var donkiLibs = []string{
 	"okhttp3/OkHttpClient.class",
 }
 
-// Operator/family-unique: never appear in legit code (contract anchor first).
 var donkiStrong = []string{
 	"0x9044f5762e43b23ba91d124b51a045f1b51da652",
 	"0x1f1bd692",
@@ -1179,7 +1053,7 @@ func scoreDonkiJar(path string) finding {
 	f.Size = st.Size()
 	if h, err := sha256File(path); err == nil {
 		f.SHA256 = h
-		// Exact sample match convicts immediately (hash equality = same file).
+
 		if strings.EqualFold(h, donkiModuleSHA256) {
 			f.Score = 10
 			f.Verdict = "CONFIRMED"
@@ -1268,8 +1142,7 @@ func scoreDonkiJar(path string) finding {
 		anchors++
 		reasons = append(reasons, "manifest Main-Class: dev.majanito.security.Main (Donki stage-2)")
 	}
-	// Stage-2 filename. Weak alone (never an anchor — "SecurityManager" is a
-	// generic term), but corroborates when pivots are present.
+
 	if strings.EqualFold(filepath.Base(path), "SecurityManager.jar") {
 		score += 1
 		reasons = append(reasons, "filename SecurityManager.jar (Donki stage-2 name)")
@@ -1331,9 +1204,6 @@ func scoreDonkiJar(path string) finding {
 		reasons = append(reasons, "support: "+strings.Join(snames, ", "))
 	}
 
-	// Anti-FP gate: bare com/example names are tutorial defaults. Without a
-	// builder anchor (or 2+ operator-unique pivots that never occur legit),
-	// generic strings must not fire.
 	if anchors == 0 && len(strongHits) < 2 {
 		f.Score = 0
 		f.Verdict = "clean"
@@ -1350,9 +1220,7 @@ func scoreDonkiJar(path string) finding {
 	default:
 		f.Verdict = "clean"
 	}
-	// Conviction floor: on-chain contract + any other pivot convicts on its
-	// own; otherwise 2+ Donki-unique pivots convict. Generic support strings
-	// (systemInfo, eth_call) are excluded — legit apps use them.
+
 	if f.Verdict != "CONFIRMED" {
 		_, hasContract := strongHits["0x9044f5762e43b23ba91d124b51a045f1b51da652"]
 		unique := 0
@@ -1373,8 +1241,6 @@ func scoreDonkiJar(path string) finding {
 	return f
 }
 
-// scoreJarAll runs every family JAR scorer and keeps the strongest verdict
-// (CONFIRMED > SUSPICIOUS > clean; ties broken by higher score).
 func scoreJarAll(path string) finding {
 	cands := []finding{scoreJar(path), scoreWeedHackJar(path), scoreWXSJar(path), scoreDonkiJar(path)}
 	best := cands[0]
@@ -1385,7 +1251,7 @@ func scoreJarAll(path string) finding {
 			bestRank = r
 		}
 	}
-	// Preserve the "not a readable zip" signal for the EXE-fallback check.
+
 	if best.Verdict == "clean" {
 		for _, c := range cands {
 			if len(c.Reasons) == 1 && c.Reasons[0] == "not a readable zip" {
@@ -1407,18 +1273,6 @@ func verdictRank(v string) int {
 		return 0
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Exact-hash module: wipers, worms, and curated samples.
-// Hash equality has no false-positive risk (identical SHA256 = same file),
-// so these bypass heuristic scoring. Keyed by file size so the SHA256 is
-// only computed for size matches.
-// Dual-use tools (PsExec, Mimikatz) and uncharacterized curios (payload_4,
-// Krotten) are SUSPICIOUS / known-sample, never asserted as a family.
-// MEMZ-Clean.exe is deliberately excluded: it is a cleaner, not malware.
-// Donki Module.jar is NOT hashed here — it is scored heuristically by
-// scoreDonkiJar (plus an exact-SHA fast path) so JNIC rebuilds still fire.
-// ---------------------------------------------------------------------------
 
 type hashEntry struct {
 	SHA     string
@@ -1475,15 +1329,14 @@ func isSilentNetFabric(data []byte) bool {
 		return false
 	}
 	s := string(data)
-	// SilentNet template: id package|sample, entrypoint com.github.<random>,
-	// icon assets/package/icon.png, description Core library module|sample.
+
 	idPkg := strings.Contains(s, `"id"`) && (strings.Contains(s, `"package"`) || strings.Contains(s, `"sample"`))
 	entry := strings.Contains(s, "com.github.")
 	icon := strings.Contains(s, "assets/package/icon.png")
 	if idPkg && entry && icon {
 		return true
 	}
-	// Tolerate minified JSON without spaces.
+
 	nospace := strings.ReplaceAll(s, " ", "")
 	if strings.Contains(nospace, `"id":"package"`) || strings.Contains(nospace, `"id":"sample"`) {
 		if strings.Contains(s, "com.github.") {
@@ -1493,9 +1346,6 @@ func isSilentNetFabric(data []byte) bool {
 	return false
 }
 
-// scoreRaw scans a non-ZIP file (EXE/DLL/script) for stage markers.
-// Fast path: files without any NtProfile/AppHost/Donki signal are
-// rejected after a single cheap pass, so clean hosts scan quickly.
 func scoreRaw(path string) finding {
 	f := finding{Path: path, Kind: "exe-variant", Verdict: "clean"}
 	st, err := os.Stat(path)
@@ -1519,9 +1369,7 @@ func scoreRaw(path string) finding {
 		return f
 	}
 	defer fh.Close()
-	// Fast prefilter: read the first 2MB and look for a marker every
-	// SilentNet/Donki PE/script must contain. Clean files exit here after one
-	// cheap scan instead of ~100 substring + UTF-16 searches over 16MB.
+
 	const preRead = 2 << 20
 	head, _ := io.ReadAll(io.LimitReader(fh, preRead))
 	lowerHead := bytes.ToLower(head)
@@ -1543,8 +1391,7 @@ func scoreRaw(path string) finding {
 		bytes.Contains(head, []byte("dQw4w9WgXcQ")) ||
 		bytes.Contains(head, []byte("/api/receive"))
 	if !hasPrefilter && !strings.HasSuffix(strings.ToLower(path), "main.py") && !strings.Contains(strings.ToLower(path), "index.js") {
-		// Small scripts could hide markers past 2MB; only extend the search
-		// for non-PE files under 8MB. Big clean PEs are rejected here.
+
 		lowerPath := strings.ToLower(path)
 		isPE := strings.HasSuffix(lowerPath, ".exe") || strings.HasSuffix(lowerPath, ".dll")
 		if isPE || f.Size > 8<<20 {
@@ -1553,10 +1400,10 @@ func scoreRaw(path string) finding {
 			return f
 		}
 	}
-	// Full read up to 16MB head: IOCs live in headers/resources, padding at tail is irrelevant.
+
 	var data []byte
 	if int64(len(head)) >= f.Size || int64(len(head)) >= preRead {
-		// head already holds the first 2MB; read the remainder up to 16MB total.
+
 		rest, _ := io.ReadAll(io.LimitReader(fh, (16<<20)-int64(len(head))))
 		data = append(head, rest...)
 	} else {
@@ -1569,7 +1416,7 @@ func scoreRaw(path string) finding {
 	markers = append(markers, wxsStrong...)
 	markers = append(markers, donkiStrong...)
 	markers = append(markers, donkiSupport...)
-	// Plus live literals from the .yar file.
+
 	markers = append(markers, yaraLiterals...)
 
 	hits := map[string]bool{}
@@ -1581,7 +1428,7 @@ func scoreRaw(path string) finding {
 		if bytes.Contains(data, []byte(m)) || bytes.Contains(lower, bytes.ToLower([]byte(m))) {
 			hits[m] = true
 		} else {
-			// UTF-16LE version (Windows binaries often store strings wide).
+
 			w := utf16LE(m)
 			if len(w) > 0 && bytes.Contains(data, w) {
 				hits[m] = true
@@ -1597,8 +1444,7 @@ func scoreRaw(path string) finding {
 		score += 4
 		reasons = append(reasons, "NtProfileIndex staging marker")
 	}
-	// Count supporting markers: SilentNet, WeedHack and Donki sets separately
-	// so the finding can be attributed to the right family.
+
 	support := 0
 	for _, k := range []string{"_spawn.log", "-restarted", "AppHost", "main.py", "python.exe", "jre-embedded", "X-Runtime-Env", "NtProfileSync", "/shard/submitData", "/cdn/e/", fernetKey, contractAddress, "LOCALAPPDATA"} {
 		if hits[k] {
@@ -1617,8 +1463,7 @@ func scoreRaw(path string) finding {
 			donkiSupportN++
 		}
 	}
-	// Donki-unique pivots: generics (eth_call, systemInfo, sqlite jar name)
-	// never convict on their own.
+
 	donkiUnique := 0
 	for _, k := range []string{donkiContract, donkiSelector, "/api/receive", "/files/jar/security", "/api/static/index.js", "Initializing Donki", "donki_staging", "SecurityManager.jar", donkiStage2Main, "abe_decrypt_", "app_bound_encrypted_key", "donkiFileInfos", "X-Tracking-ID", "dQw4w9WgXcQ:", "{708860E0-F641-4611-8895-7D867DD3675B}", "{1FCBE96C-1697-43AF-9140-2897C7C69767}", "nkbihfbeogaeaoehlefnkodbefgpgknn", "discord.com/api/v9/users/@me", "discord_desktop_core"} {
 		if hits[k] {
@@ -1626,7 +1471,7 @@ func scoreRaw(path string) finding {
 		}
 	}
 	if donkiUnique == 0 {
-		donkiSupportN = 0 // generics alone must not fire
+		donkiSupportN = 0
 	}
 	score += support + weedSupport + donkiSupportN
 	if support > 0 {
@@ -1664,7 +1509,7 @@ func scoreRaw(path string) finding {
 		sort.Strings(names)
 		reasons = append(reasons, "Donki markers: "+strings.Join(names, ", "))
 	}
-	// main.py loader hash check (exact stage-2 launcher).
+
 	if strings.HasSuffix(strings.ToLower(path), "main.py") && f.SHA256 == mainPySHA256 {
 		score += 6
 		reasons = append(reasons, "exact AppHost/main.py hash match")
@@ -1691,10 +1536,6 @@ func scoreRaw(path string) finding {
 		}
 	}
 
-	// PE files need at least staging + 1 support, scripts need 3+ markers.
-	// WeedHack EXEs (KryptonClient.exe style) carry operator pivots instead,
-	// as do Donki second-stage / JNIC native libs (contract + endpoint + family
-	// markers, always decrypted in memory / plaintext when stringObf=false).
 	lowerPath := strings.ToLower(path)
 	isPE := strings.HasSuffix(lowerPath, ".exe") || strings.HasSuffix(lowerPath, ".dll")
 	if isPE {
@@ -1742,13 +1583,6 @@ func utf16LE(s string) []byte {
 	return b
 }
 
-// ---------------------------------------------------------------------------
-// Scan roots: common places SilentNet lives.
-// ---------------------------------------------------------------------------
-
-// gameLauncher maps a game launcher to the instance/mod directories where a
-// malicious mod or dropper can hide. Paths may use %ENV% vars (expanded by
-// dedupeRoots); missing directories are silently skipped.
 type gameLauncher struct {
 	Name  string
 	Paths []string
@@ -1775,17 +1609,13 @@ func knownGameLaunchers() []gameLauncher {
 		{"Badlion", []string{`%APPDATA%\.badlion`}},
 		{"Lunar", []string{`%USERPROFILE%\.lunarclient`}},
 		{"Feather", []string{`%APPDATA%\.feather`, `%APPDATA%\.minecraft\feather`}},
-		// Dawn: InPvP's Feather successor (instances/mods carry over from
-		// .feather) plus likely dirs of the dawnmc.gg client, whose exact
-		// data dir is not publicly documented. Missing dirs are skipped.
+
 		{"Dawn", []string{`%APPDATA%\.dawn`, `%APPDATA%\Dawn`, `%APPDATA%\dawnmc`, `%APPDATA%\.dawnmc`, `%USERPROFILE%\.dawn`}},
 		{"TLauncher", []string{`%APPDATA%\.tlauncher\legacy\Minecraft\game`}},
 		{"XMCL", []string{`%APPDATA%\xmcl`}},
 	}
 }
 
-// detectGameLaunchers returns the names of launchers with at least one
-// existing data directory on this host.
 func detectGameLaunchers() []string {
 	var found []string
 	for _, l := range knownGameLaunchers() {
@@ -1800,7 +1630,7 @@ func detectGameLaunchers() []string {
 }
 
 func defaultScanRoots(full bool) []string {
-	// Targeted override for fast sample-dir validation (e.g. --roots "C:\samples").
+
 	if *fRoots != "" {
 		roots := []string{}
 		for _, p := range strings.Split(*fRoots, ",") {
@@ -1834,7 +1664,7 @@ func defaultScanRoots(full bool) []string {
 		filepath.Join(u, "Desktop"),
 		filepath.Join(u, "Documents"),
 	}
-	// Every known game launcher's mod/instance directories.
+
 	for _, l := range knownGameLaunchers() {
 		roots = append(roots, l.Paths...)
 	}
@@ -1846,7 +1676,7 @@ func defaultScanRoots(full bool) []string {
 		stagingDir(),
 	)
 	if full {
-		// Walk every user profile + ProgramData, but still skip Windows/Program Files (see walker).
+
 		roots = append(roots,
 			`C:\Users`,
 			progdata,
@@ -1854,7 +1684,7 @@ func defaultScanRoots(full bool) []string {
 			filepath.Join(pub, "Downloads"),
 		)
 	}
-	// Extra paths for testing / custom hunts.
+
 	if *fExtraPath != "" {
 		for _, p := range strings.Split(*fExtraPath, ",") {
 			p = strings.TrimSpace(strings.Trim(p, `"`))
@@ -1863,7 +1693,7 @@ func defaultScanRoots(full bool) []string {
 			}
 		}
 	}
-	// Deduplicate + keep existing dirs (files are handled separately).
+
 	return dedupeRoots(roots)
 }
 
@@ -1884,7 +1714,7 @@ func dedupeRoots(roots []string) []string {
 		if dirExists(r) {
 			out = append(out, r)
 		} else if exists(r) {
-			out = append(out, r) // single file
+			out = append(out, r)
 		} else {
 			vlogf("scan root missing, skipping: %s", r)
 		}
@@ -1895,8 +1725,7 @@ func dedupeRoots(roots []string) []string {
 var skipDirNames = map[string]bool{
 	"windows": true, "$recycle.bin": true, "system volume information": true,
 	"$windows.~bt": true, "$windows.~ws": true, "node_modules": true, ".git": true,
-	// Minecraft / launcher caches: hundreds of legit jars, never dropper homes.
-	// Droppers live in mods/, versions/, instance root — those stay scanned.
+
 	"libraries": true, "assets": true, "saves": true, "config": true, "logs": true,
 	"crash-reports": true, "resourcepacks": true, "shaderpacks": true,
 	".fabric": true, "processedmods": true, "natives": true, "runtime": true,
@@ -1904,14 +1733,17 @@ var skipDirNames = map[string]bool{
 
 func shouldSkipDir(path string) bool {
 	lp := strings.ToLower(path)
-	// Never descend into the OS or installed programs during hunts.
+
 	if strings.HasPrefix(lp, `c:\windows`) {
 		return true
 	}
 	if strings.HasPrefix(lp, `c:\program files`) {
 		return true
 	}
-	// Never descend into our own quarantine.
+
+	if strings.Contains(lp, "mrt"+string(filepath.Separator)+"quarantine") {
+		return true
+	}
 	if strings.Contains(lp, "silentnetremover"+string(filepath.Separator)+"quarantine") {
 		return true
 	}
@@ -1929,21 +1761,17 @@ func collectCandidates(roots []string) []string {
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 8)
 
-	// Never scan our own binary: it embeds IOC strings (YARA literals, C2
-	// domains, Fernet key) and would otherwise self-match the raw scan.
 	selfExe := ""
 	if exe, err := os.Executable(); err == nil {
 		selfExe = strings.ToLower(exe)
-		// Also skip the whole tool directory during default common-places
-		// sweeps (Desktop is a scan root and the tool lives there).
+
 	}
 
 	addFile := func(p string) {
 		if selfExe != "" && strings.ToLower(p) == selfExe {
 			return
 		}
-		// Roots overlap (e.g. ModrinthApp + ModrinthApp\profiles), so the
-		// same file can be reached twice via parallel walkers.
+
 		key := strings.ToLower(p)
 		mu.Lock()
 		if !seenFiles[key] {
@@ -1982,12 +1810,11 @@ func collectCandidates(roots []string) []string {
 					return nil
 				}
 				ext := strings.ToLower(filepath.Ext(p))
-				// Size prefilter: SilentNet droppers are 0.7–18MB JARs (22MB max
-				// observed CDN bundle). Huge legit PEs/DLLs are skipped outright.
+
 				if info, err := d.Info(); err == nil {
 					sz := info.Size()
 					if sz == 0 {
-						return nil // lock files / placeholders
+						return nil
 					}
 					switch ext {
 					case ".exe", ".dll":
@@ -2008,9 +1835,7 @@ func collectCandidates(roots []string) []string {
 				case ".jar", ".zip", ".exe", ".dll", ".sys", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".lnk", ".infected":
 					addFile(p)
 				default:
-					// Stage-2 loader always lives at AppHost/main.py — collect it
-					// wherever it appears (exact-hash check in scoreRaw).
-					// Sidecar *.jar.meta / *.jar.sha1 / *.jar.txt files are metadata, never droppers.
+
 					lp := strings.ToLower(p)
 					if strings.HasSuffix(lp, ".meta") || strings.HasSuffix(lp, ".sha1") || strings.HasSuffix(lp, ".sha256") || strings.HasSuffix(lp, ".txt") {
 						return nil
@@ -2033,8 +1858,7 @@ func collectCandidates(roots []string) []string {
 
 func scanFiles(files []string) []finding {
 	yaraBin := externalYara()
-	// loadYaraLiterals() runs in main() before the hunt, so yaraRulesByFamily
-	// already counts embedded (materialized to temp) + on-disk rule files.
+
 	nRules := len(yaraRulesByFamily)
 	if yaraBin != "" && nRules > 0 {
 		logf("[yara] external binary found (%s); internal scores confirmed against %d rule file(s)", yaraBin, nRules)
@@ -2059,7 +1883,7 @@ func scanFiles(files []string) []finding {
 		go func() {
 			defer wg.Done()
 			for p := range jobs {
-				// Exact-hash destructive/hacktool match first (size-gated, cheap).
+
 				if hf := checkFileHash(p); hf.Verdict == "CONFIRMED" || hf.Verdict == "SUSPICIOUS" {
 					results <- hf
 					continue
@@ -2070,8 +1894,7 @@ func scanFiles(files []string) []finding {
 				isJarLike := ext == ".jar" || ext == ".zip" || strings.Contains(lp, ".jar.")
 				if isJarLike {
 					f = scoreJarAll(p)
-					// Only fall back to raw scan when ZIP parsing failed outright
-					// (e.g. EXE-renamed dropper). Clean scored JARs stay clean.
+
 					if len(f.Reasons) == 1 && f.Reasons[0] == "not a readable zip" {
 						if r := scoreRaw(p); r.Verdict != "clean" {
 							f = r
@@ -2106,12 +1929,8 @@ func scanFiles(files []string) []finding {
 	return out
 }
 
-// ---------------------------------------------------------------------------
-// Live triage: pipe, staging dir, processes
-// ---------------------------------------------------------------------------
-
 func pipeExists() bool {
-	// Opening the pipe only tests for a listener; it does not execute anything.
+
 	f, err := os.OpenFile(pipeName, os.O_RDWR, 0600)
 	if err != nil {
 		return false
@@ -2128,9 +1947,7 @@ type procInfo struct {
 }
 
 func listProcesses() []procInfo {
-	// PowerShell CIM first: wmic is deprecated and absent from fresh
-	// Windows 11 installs. wmic stays as a fallback for older hosts.
-	// Both emit CSV parsed by parseWmicCSV.
+
 	ps := `Get-CimInstance Win32_Process | Select-Object ProcessId,ExecutablePath,CommandLine | ConvertTo-Csv -NoTypeInformation`
 	out, code := runCmd("powershell", "-NoProfile", "-NonInteractive", "-Command", ps)
 	if code == 0 && strings.Contains(out, "CommandLine") {
@@ -2203,12 +2020,11 @@ func isStealerProcess(p procInfo) (bool, string) {
 	if strings.Contains(cmd, "-restarted") && (strings.Contains(cmd, "com.github") || strings.Contains(cmd, ".jar")) {
 		return true, "stage-1 restart marker (-restarted + com.github/.jar)"
 	}
-	// WeedHack standalone re-exec gate: javaw.exe -jar <mod>.jar --jw
+
 	if strings.Contains(cmd, "--jw") && strings.Contains(cmd, ".jar") {
 		return true, "WeedHack re-exec marker (--jw + .jar)"
 	}
-	// Donki stage-2 first: dev.majanito.security.Main must attribute to Donki,
-	// not the generic majanito check below (WeedHack uses dev.majanito.Main).
+
 	if strings.Contains(joined, "dev.majanito.security.main") || strings.Contains(joined, "securitymanager.jar") {
 		return true, "Donki stage-2 (SecurityManager.jar / dev.majanito.security.Main)"
 	}
@@ -2218,10 +2034,7 @@ func isStealerProcess(p procInfo) (bool, string) {
 	if strings.Contains(joined, "donki_staging") || strings.Contains(joined, "abe_decrypt_") {
 		return true, "Donki staging dir / ABE pipe in command line"
 	}
-	// Donki stage-1 entrypoint. Gated on a Java launcher in the command line
-	// so a researcher shell that merely mentions the class (grep, test
-	// fixture builds) is never matched — the stealer itself runs under
-	// java/javaw (directly or via the Minecraft launcher).
+
 	if strings.Contains(cmd, "com.example.main") && strings.Contains(cmd, ".jar") &&
 		(strings.Contains(exe, "java") || strings.Contains(cmd, "javaw") || strings.Contains(cmd, "-jar") || strings.Contains(cmd, "-cp")) {
 		return true, "Donki stage-1 entrypoint (com.example.Main + .jar under java)"
@@ -2229,11 +2042,11 @@ func isStealerProcess(p procInfo) (bool, string) {
 	if strings.Contains(joined, "majanito") || strings.Contains(joined, "initializeweedhack") {
 		return true, "WeedHack stage-2 class in command line"
 	}
-	// WXSGrabber RAT/persistence scripts.
+
 	if strings.Contains(joined, ".sys-cache") || strings.Contains(joined, "listener.ps1") || strings.Contains(joined, "restorer.ps1") {
 		return true, "WXSGrabber .sys-cache script in command line"
 	}
-	// WannaCry worm/ransom processes (no legit Windows binary uses these names).
+
 	if exe == "tasksche.exe" || exe == "taskdl.exe" || exe == "wcry.exe" ||
 		strings.Contains(exe, "@wanadecryptor@") || strings.Contains(exe, "@wanadecryptor") {
 		return true, "WannaCry process image name"
@@ -2260,10 +2073,6 @@ func killProcesses(procs []procInfo, dry bool) int {
 	return killed
 }
 
-// ---------------------------------------------------------------------------
-// Removal primitives
-// ---------------------------------------------------------------------------
-
 func quarantineFile(path, quarantine string, f finding, dry bool) (string, error) {
 	if !*fAllowSampleDir && isSampleCollection(path) {
 		return "", fmt.Errorf("refusing to quarantine inside the C:\\MALWARE research collection (re-run with --allow-sample-dir to override)")
@@ -2277,7 +2086,7 @@ func quarantineFile(path, quarantine string, f finding, dry bool) (string, error
 	base := filepath.Base(path)
 	stamp := time.Now().Format("20060102-150405")
 	dest := filepath.Join(quarantine, fmt.Sprintf("%s_%s.quarantined", base, stamp))
-	// Same-second/same-name collisions (e.g. two FakeMod.jar in one run).
+
 	for i := 2; exists(dest) || exists(dest+".json"); i++ {
 		dest = filepath.Join(quarantine, fmt.Sprintf("%s_%s_%d.quarantined", base, stamp, i))
 	}
@@ -2288,7 +2097,7 @@ func quarantineFile(path, quarantine string, f finding, dry bool) (string, error
 	if err := os.MkdirAll(quarantine, 0755); err != nil {
 		return "", err
 	}
-	// Same-volume rename first; cross-volume falls back to copy+delete.
+
 	if err := os.Rename(path, dest); err != nil {
 		in, err2 := os.Open(path)
 		if err2 != nil {
@@ -2324,7 +2133,7 @@ func deletePath(path string, dry bool) error {
 		logf("[dry-run] would delete %s", path)
 		return nil
 	}
-	// Clear read-only bits first (Python embed zips ship read-only files).
+
 	filepath.Walk(path, func(p string, info os.FileInfo, err error) error {
 		if err == nil {
 			os.Chmod(p, 0700)
@@ -2345,7 +2154,7 @@ func removeStaging(dry bool) bool {
 		return true
 	}
 	logf("[triage] staging dir PRESENT (infected): %s", sd)
-	// Show what's inside for the log, then wipe it.
+
 	entries, _ := os.ReadDir(sd)
 	names := []string{}
 	for _, e := range entries {
@@ -2398,7 +2207,6 @@ func cleanSpawnLogs(dry bool) int {
 	return n
 }
 
-// cleanWeedHack removes WeedHack's dropped JNIC natives (%TEMP%\jvmtp-*.dll).
 func cleanWeedHack(dry bool) int {
 	n := 0
 	for _, dir := range []string{os.Getenv("TEMP"), os.Getenv("TMP"), filepath.Join(os.Getenv("LOCALAPPDATA"), "Temp")} {
@@ -2425,9 +2233,6 @@ func cleanWeedHack(dry bool) int {
 	return n
 }
 
-// cleanWXS removes WXSGrabber persistence: the hidden %APPDATA%\.sys-cache
-// dir and the exact Run value names FabricRuntimeInit/FabricListenerInit.
-// Value names are exact (never substring-matched) so legit entries survive.
 func cleanWXS(dry bool) int {
 	n := 0
 	dir := filepath.Join(os.Getenv("APPDATA"), ".sys-cache")
@@ -2486,9 +2291,6 @@ func donkiStagingDirs() []string {
 	return out
 }
 
-// donkiPipeExists reports a live ABE-decrypt pipe (abe_decrypt_<ms>_<attempt>).
-// Pipes live under \\.\pipe\ and are listed via directory read; failure means
-// "unknown", reported as absent with verbose logging.
 func donkiPipeExists() bool {
 	entries, err := os.ReadDir(`\\.\pipe\`)
 	if err != nil {
@@ -2503,14 +2305,6 @@ func donkiPipeExists() bool {
 	return false
 }
 
-// cleanDonki removes Donki's malware-only staging: %APPDATA%\Microsoft
-// \SecurityUpdates (hosts SecurityManager.jar stage-2), %TEMP%\donki_staging
-// work dirs, and the %TEMP%-root sqlite-jdbc drop (deleteOnExit driver Donki
-// downloads from repo1.maven.org — a TEMP-root copy dropped by Java is not a
-// legit Maven repo layout). JNA jna-natives-* extracts are intentionally left
-// alone (legit JNA apps use the same path). The Discord discord_desktop_core
-// index.js injection is quarantined (never silently deleted) when it carries
-// Donki markers; otherwise it is only reported so a reinstall can fix it.
 func cleanDonki(dry bool, quarantine string) int {
 	n := 0
 	if dir := donkiSecurityDir(); dirExists(dir) {
@@ -2551,8 +2345,7 @@ func cleanDonki(dry bool, quarantine string) int {
 			}
 		}
 	}
-	// Discord client injection: index.js overwritten with baseUrl +
-	// "/api/static/index.js" payload. Quarantine on Donki-marker hit.
+
 	discordBase := filepath.Join(os.Getenv("LOCALAPPDATA"), "Discord")
 	if dirExists(discordBase) {
 		_ = filepath.WalkDir(discordBase, func(p string, d os.DirEntry, err error) error {
@@ -2591,8 +2384,6 @@ func cleanDonki(dry bool, quarantine string) int {
 	return n
 }
 
-// cleanWannaCry stops/deletes the WannaCry SMB-spreader service. File and
-// process handling is done by the hash module and process killer.
 func cleanWannaCry(dry bool) int {
 	if out, code := runCmd("sc.exe", "query", "mssecsvc2.0"); code != 0 {
 		vlogf("mssecsvc2.0 service absent (good)")
@@ -2614,8 +2405,6 @@ func cleanWannaCry(dry bool) int {
 	return 0
 }
 
-// Registry helpers via reg.exe (no external Go deps, works on stock Windows).
-
 func regDeleteTree(key string, dry bool) bool {
 	if dry {
 		logf("[dry-run] would delete registry tree %s", key)
@@ -2630,7 +2419,6 @@ func regDeleteTree(key string, dry bool) bool {
 	return false
 }
 
-// regFindValues returns "key \0 valueName \0 data" triples containing needle.
 func regFindValues(key, needle string) [][3]string {
 	out, code := runCmd("reg", "query", key)
 	if code != 0 {
@@ -2659,7 +2447,7 @@ func regFindValues(key, needle string) [][3]string {
 
 func cleanRegistry(dry bool) int {
 	cleaned := 0
-	// 1. Custom mutex/config tree (IOC from the paper).
+
 	for _, k := range []string{
 		`HKCU\Software\Microsoft\Windows\NtProfileIndex`,
 		`HKLM\Software\Microsoft\Windows\NtProfileIndex`,
@@ -2672,7 +2460,7 @@ func cleanRegistry(dry bool) int {
 			}
 		}
 	}
-	// 2. Autorun values pointing at the staging dir.
+
 	runKeys := []string{
 		`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`,
 		`HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce`,
@@ -2745,11 +2533,7 @@ func cleanScheduledTasks(dry bool) int {
 		}
 		name, run := get(idxName), get(idxRun)
 		blob := strings.ToLower(name + " " + run + " " + strings.Join(row, " "))
-		// NOTE: bare "apphost" also matches the legitimate Windows
-		// \Microsoft\Windows\AppHost\AppHostRegistrationVerifier tasks, so
-		// only bundle-specific markers count here. Bare "majanito" alone is
-		// also avoided: Donki/WeedHack share the prefix, so stage-specific
-		// markers (securitymanager, thread_silent, jvmtp, --jw) decide.
+
 		if strings.Contains(blob, "ntprofileindex") ||
 			strings.Contains(blob, "apphost\\main.py") ||
 			strings.Contains(blob, "apphost/main.py") ||
@@ -2838,10 +2622,6 @@ func cleanStartup(dry bool, quarantine string) int {
 	return n
 }
 
-// ---------------------------------------------------------------------------
-// Hardening: block what the paper lists, flush DNS.
-// ---------------------------------------------------------------------------
-
 func hardenHost(dry bool) {
 	if *fNoHarden {
 		logf("[harden] skipped (--no-harden)")
@@ -2853,12 +2633,7 @@ func hardenHost(dry bool) {
 			strings.Join(c2Domains, ", "), strings.Join(c2IPs, ", "))
 		return
 	}
-	// Hosts file for domains (firewall cannot block by name). Covers all
-	// families with static domains: SilentNet C2/portal, WXSGrabber exfil +
-	// per-victim Firebase host (NOT *.firebasedatabase.app — legit apps use
-	// it), WeedHack rotating C2s and MaaS shop. Donki has NO static hostname
-	// (live C2 is resolved via eth_call to 0x9044f5…da652) so there is nothing
-	// to sinkhole here — resolve the hostname in a sandbox and block it there.
+
 	hostsPath := `C:\Windows\System32\drivers\etc\hosts`
 	extraDomains := []string{
 		"api.x-grabber.com",
@@ -2880,7 +2655,7 @@ func hardenHost(dry bool) {
 		if len(missing) > 0 {
 			logf("[harden] adding hosts blocks for: %s", strings.Join(missing, ", "))
 			if !dry {
-				backup := hostsPath + ".silentnet-remover.bak"
+				backup := hostsPath + ".mrt.bak"
 				if !exists(backup) {
 					os.WriteFile(backup, data, 0644)
 				}
@@ -2901,9 +2676,9 @@ func hardenHost(dry bool) {
 	} else {
 		warnf("cannot read hosts file: %v", err)
 	}
-	// Firewall for IPs.
+
 	for _, ip := range c2IPs {
-		name := "SilentNet-Block-" + strings.ReplaceAll(ip, ".", "-")
+		name := "MRT-Block-" + strings.ReplaceAll(ip, ".", "-")
 		out, _ := runCmd("netsh", "advfirewall", "firewall", "show", "rule", "name="+name)
 		if strings.Contains(out, name) {
 			vlogf("firewall rule exists: %s", name)
@@ -2913,7 +2688,7 @@ func hardenHost(dry bool) {
 		if !dry {
 			if _, code := runCmd("netsh", "advfirewall", "firewall", "add", "rule",
 				"name="+name, "dir=out", "action=block", "remoteip="+ip,
-				"description=SilentNet C2 block"); code != 0 {
+				"description=MRT C2 block"); code != 0 {
 				warnf("failed to add firewall rule for %s", ip)
 			}
 		}
@@ -2922,10 +2697,6 @@ func hardenHost(dry bool) {
 		logf("[harden] DNS cache flushed")
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Main flow
-// ---------------------------------------------------------------------------
 
 func confirmOrExit(nFindings int, stagingPresent, pipePresent bool) {
 	if *fYes || *fDryRun || *fScanOnly {
@@ -3027,7 +2798,6 @@ func main() {
 		logf("--dry-run: no changes will be made")
 	}
 
-	// ---- live triage first (cheap, no walk needed) ----
 	if found := detectGameLaunchers(); len(found) > 0 {
 		logf("[triage] detected launchers: %s", strings.Join(found, ", "))
 	} else {
@@ -3074,7 +2844,6 @@ func main() {
 		vlogf("no live stealer processes matched")
 	}
 
-	// ---- file hunt ----
 	roots := defaultScanRoots(*fFull)
 	logf("[scan] roots (%d):", len(roots))
 	for _, r := range roots {
@@ -3123,13 +2892,11 @@ func main() {
 		logf("[quarantine] dir: %s", qdir)
 	}
 
-	// ---- kill before deleting (else files are locked) ----
 	killed := killProcesses(procs, *fDryRun)
 	logf("[kill] terminated %d stealer process(es)", killed)
-	// Re-list: staged python often respawns from the JAR until the dropper is quarantined.
+
 	time.Sleep(800 * time.Millisecond)
 
-	// ---- droppers ----
 	handled := 0
 	for _, f := range findings {
 		if f.Verdict == "clean" {
@@ -3161,7 +2928,6 @@ func main() {
 	}
 	logf("[droppers] handled %d file(s)", handled)
 
-	// ---- staging, logs, persistence (all families) ----
 	stagingOK := removeStaging(*fDryRun)
 	nLogs := cleanSpawnLogs(*fDryRun)
 	nWeed := cleanWeedHack(*fDryRun)
@@ -3177,7 +2943,6 @@ func main() {
 
 	hardenHost(*fDryRun)
 
-	// ---- verify ----
 	time.Sleep(500 * time.Millisecond)
 	stillStaging := dirExists(stagingDir())
 	stillPipe := pipeExists()
