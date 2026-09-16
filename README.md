@@ -16,7 +16,7 @@ It is made because of official and known tools lack the ability to remove uncomm
 1. As of now it only supports devices running [Windows](https://www.microsoft.com/en-us/windows) 10 or 11
 2. Download the latest release from [the releases page](https://github.com/L702x/MRT/releases)
 3. once downloaded, open CMD as Administrator in the folder that you have downloaded the tool to
-4. finally, to use the tool run either `.\mrt.exe` or `.\mrt.exe --yes`
+4. finally, to use the tool run either `.\mrt.exe` (you must confirm the removal manually) or `.\mrt.exe --yes` and let it finish
 
 # FAQ
 Why should I run it as administrator?
