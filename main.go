@@ -22,7 +22,7 @@ import (
 	"time"
 )
 
-const toolVersion = "1.4.0"
+const toolVersion = "1.5.0"
 
 var (
 	c2Domains = []string{
@@ -70,15 +70,102 @@ var (
 	fListLaunchers = flag.Bool("list-launchers", false, "List known game launchers and which ones are installed, then exit")
 )
 
-func logf(format string, a ...any) { fmt.Printf(format+"\n", a...) }
+func logf(format string, a ...any) {
+	msg := fmt.Sprintf(format, a...)
+	fmt.Fprintln(os.Stdout, msg)
+	writeLog(msg)
+}
 
 func vlogf(format string, a ...any) {
 	if *fVerbose {
-		fmt.Printf("[verbose] "+format+"\n", a...)
+		msg := "[verbose] " + fmt.Sprintf(format, a...)
+		fmt.Fprintln(os.Stdout, msg)
+		writeLog(msg)
 	}
 }
 
-func warnf(format string, a ...any) { fmt.Printf("[WARN] "+format+"\n", a...) }
+func warnf(format string, a ...any) {
+	msg := "[WARN] " + fmt.Sprintf(format, a...)
+	fmt.Fprintln(os.Stdout, msg)
+	writeLog(msg)
+}
+
+// outf/outln/outPrint mirror user-facing output to the console and to
+// mrt.log so the log file holds everything the tool printed.
+func outf(format string, a ...any) {
+	msg := fmt.Sprintf(format, a...)
+	msg = strings.TrimSuffix(msg, "\n")
+	fmt.Fprintln(os.Stdout, msg)
+	writeLog(msg)
+}
+
+func outln(a ...any) {
+	msg := fmt.Sprintln(a...)
+	msg = strings.TrimSuffix(msg, "\n")
+	fmt.Fprintln(os.Stdout, msg)
+	writeLog(msg)
+}
+
+func outPrint(a ...any) {
+	msg := fmt.Sprint(a...)
+	fmt.Fprint(os.Stdout, msg)
+	writeLog(msg)
+}
+
+var (
+	logFile *os.File
+	logMu   sync.Mutex
+)
+
+// initLogFile opens (or creates) mrt.log in the directory the tool was
+// run from and appends all subsequent output to it. Logging never stops
+// the tool: if the file cannot be opened, the run continues on console.
+func initLogFile() {
+	wd, err := os.Getwd()
+	if err != nil {
+		outf("[WARN] cannot determine working directory for mrt.log: %v", err)
+		return
+	}
+	path := filepath.Join(wd, "mrt.log")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		outf("[WARN] cannot open log file %s: %v (continuing without file logging)", path, err)
+		return
+	}
+	logFile = f
+	fmt.Fprintf(f, "\n=== MRT v%s run %s ===\n", toolVersion, time.Now().Format(time.RFC3339))
+}
+
+// closeLogFile flushes and releases mrt.log. Writes throughout the run
+// are unbuffered, so os.Exit paths elsewhere in main lose nothing.
+func closeLogFile() {
+	logMu.Lock()
+	defer logMu.Unlock()
+	if logFile != nil {
+		fmt.Fprintln(logFile, "=== run finished ===")
+		logFile.Close()
+		logFile = nil
+	}
+}
+
+// writeLog appends msg to mrt.log with a per-line timestamp. Blank lines
+// are preserved without a timestamp. Writes are unbuffered and mutex
+// guarded so worker goroutines cannot interleave lines.
+func writeLog(msg string) {
+	logMu.Lock()
+	defer logMu.Unlock()
+	if logFile == nil {
+		return
+	}
+	stamp := time.Now().Format("2006-01-02 15:04:05")
+	for _, line := range strings.Split(msg, "\n") {
+		if strings.TrimSpace(line) == "" {
+			fmt.Fprintln(logFile, "")
+			continue
+		}
+		fmt.Fprintf(logFile, "%s %s\n", stamp, line)
+	}
+}
 
 func exists(path string) bool {
 	_, err := os.Lstat(path)
@@ -1242,7 +1329,7 @@ func scoreDonkiJar(path string) finding {
 }
 
 func scoreJarAll(path string) finding {
-	cands := []finding{scoreJar(path), scoreWeedHackJar(path), scoreWXSJar(path), scoreDonkiJar(path)}
+	cands := []finding{scoreJar(path), scoreWeedHackJar(path), scoreWXSJar(path), scoreDonkiJar(path), scoreGenericJar(path)}
 	best := cands[0]
 	bestRank := verdictRank(best.Verdict)
 	for _, c := range cands[1:] {
@@ -1346,7 +1433,7 @@ func isSilentNetFabric(data []byte) bool {
 	return false
 }
 
-func scoreRaw(path string) finding {
+func scoreRawFamily(path string) finding {
 	f := finding{Path: path, Kind: "exe-variant", Verdict: "clean"}
 	st, err := os.Stat(path)
 	if err != nil {
@@ -2702,78 +2789,86 @@ func confirmOrExit(nFindings int, stagingPresent, pipePresent bool) {
 	if *fYes || *fDryRun || *fScanOnly {
 		return
 	}
-	fmt.Println()
-	fmt.Printf("Found %d dropper file(s). Staging present: %v. Pipe %s present: %v.\n",
+	outln()
+	outf("Found %d dropper file(s). Staging present: %v. Pipe %s present: %v.",
 		nFindings, stagingPresent, pipeName, pipePresent)
-	fmt.Print("Proceed with KILL + QUARANTINE + DELETE staging + registry/task cleanup? [y/N]: ")
+	outPrint("Proceed with KILL + QUARANTINE + DELETE staging + registry/task cleanup? [y/N]: ")
 	var ans string
 	fmt.Scanln(&ans)
 	ans = strings.ToLower(strings.TrimSpace(ans))
 	if ans != "y" && ans != "yes" {
-		fmt.Println("Aborted by user. Re-run with --scan-only to just report, or --yes to proceed.")
+		outln("Aborted by user. Re-run with --scan-only to just report, or --yes to proceed.")
 		os.Exit(2)
 	}
 }
 
 func printPostRemovalChecklist(families map[string]bool) {
-	fmt.Println()
-	fmt.Println("==================== POST-REMOVAL — READ THIS ====================")
-	fmt.Println("Wiping the box does NOT revoke what was already exfiltrated.")
+	outln()
+	outln("==================== POST-REMOVAL — READ THIS ====================")
+	outln("Wiping the box does NOT revoke what was already exfiltrated.")
 	if families["silentnet"] {
-		fmt.Println("SilentNet stage-2 steals: browser passwords/cookies/cards, Discord tokens,")
-		fmt.Println("crypto wallets/seeds, Minecraft session tokens, SSH/FTP/VPN creds,")
-		fmt.Println("Telegram sessions, screenshots and keyword-targeted files.")
+		outln("SilentNet stage-2 steals: browser passwords/cookies/cards, Discord tokens,")
+		outln("crypto wallets/seeds, Minecraft session tokens, SSH/FTP/VPN creds,")
+		outln("Telegram sessions, screenshots and keyword-targeted files.")
 	}
 	if families["weedhack"] {
-		fmt.Println("WeedHack steals: Minecraft session token + browser/Discord/wallet data,")
-		fmt.Println("and its premium stage-2 is a full RAT (keylogger, webcam, shell).")
-		fmt.Println("Assume full compromise — re-image if RAT activity is suspected.")
+		outln("WeedHack steals: Minecraft session token + browser/Discord/wallet data,")
+		outln("and its premium stage-2 is a full RAT (keylogger, webcam, shell).")
+		outln("Assume full compromise — re-image if RAT activity is suspected.")
 	}
 	if families["wxsgrabber"] {
-		fmt.Println("WXSGrabber steals: browser credentials, Discord tokens, crypto wallets,")
-		fmt.Println("Minecraft/Microsoft sessions, and runs a live RAT (shell, screenshots).")
+		outln("WXSGrabber steals: browser credentials, Discord tokens, crypto wallets,")
+		outln("Minecraft/Microsoft sessions, and runs a live RAT (shell, screenshots).")
 	}
 	if families["donki"] {
-		fmt.Println("Donki steals: Chromium/Firefox passwords+cookies (incl. Chrome 127+ ABE")
-		fmt.Println("bypass via suspended-browser injection), Discord tokens + client injection")
-		fmt.Println("(discord_desktop_core/index.js), 37-browser wallet extensions, desktop")
-		fmt.Println("wallets (Exodus/Atomic/Electrum/...), Minecraft/Steam/Roblox sessions,")
-		fmt.Println("Modrinth DB, and drops stage-2 SecurityManager.jar (registry persistence).")
-		fmt.Println("Reinstall Discord after removal; assume wallets/sessions are compromised.")
+		outln("Donki steals: Chromium/Firefox passwords+cookies (incl. Chrome 127+ ABE")
+		outln("bypass via suspended-browser injection), Discord tokens + client injection")
+		outln("(discord_desktop_core/index.js), 37-browser wallet extensions, desktop")
+		outln("wallets (Exodus/Atomic/Electrum/...), Minecraft/Steam/Roblox sessions,")
+		outln("Modrinth DB, and drops stage-2 SecurityManager.jar (registry persistence).")
+		outln("Reinstall Discord after removal; assume wallets/sessions are compromised.")
 	}
 	if families["destructive"] {
-		fmt.Println("Wiper/ransomware ran here: WannaCry encrypts files (restore from BACKUP,")
-		fmt.Println("do NOT pay; patch MS17-010); NotPetya destroys the MBR (re-image);")
-		fmt.Println("Stuxnet spreads via USB/LNK (scan removable media on a clean box).")
+		outln("Wiper/ransomware ran here: WannaCry encrypts files (restore from BACKUP,")
+		outln("do NOT pay; patch MS17-010); NotPetya destroys the MBR (re-image);")
+		outln("Stuxnet spreads via USB/LNK (scan removable media on a clean box).")
 	}
-	fmt.Println()
-	fmt.Println("On a CLEAN device, immediately:")
-	fmt.Println("  1. Change passwords for every account used on this PC (browsers first),")
-	fmt.Println("     then Discord, Google/Microsoft, Steam, Git, VPN, banking/crypto.")
-	fmt.Println("  2. Discord: Settings > Authorized Apps + Devices > log out all sessions,")
-	fmt.Println("     rotate any bot/webhook tokens stored on this PC.")
-	fmt.Println("  3. Browsers: revoke sessions (Google/Facebook/etc. device lists),")
-	fmt.Println("     rotate payment cards if autofill was enabled.")
-	fmt.Println("  4. Crypto: move funds to a fresh wallet created on a CLEAN device;")
-	fmt.Println("     treat any seed/extension data on this PC as compromised.")
-	fmt.Println("  5. Minecraft: change Mojang/Microsoft password, invalidate session")
-	fmt.Println("     tokens, check .minecraft/servers.dat + launcher_accounts.json.")
-	fmt.Println("  6. SSH/FTP keys, .env files, FileZilla/WinSCP/PuTTY creds: rotate all.")
-	fmt.Println("  7. Reboot, then re-run this tool with --scan-only to verify clean.")
-	fmt.Println("==================================================================")
+	if families["generic"] {
+		outln("Generic heuristics fired: file(s) combined independent red flags")
+		outln("(Defender tampering, encoded execution, credential theft, remote")
+		outln("exfil, persistence, injection). Review the listed reasons - a lone")
+		outln("flag never convicts, so these files earned it twice over.")
+	}
+	outln()
+	outln("On a CLEAN device, immediately:")
+	outln("  1. Change passwords for every account used on this PC (browsers first),")
+	outln("     then Discord, Google/Microsoft, Steam, Git, VPN, banking/crypto.")
+	outln("  2. Discord: Settings > Authorized Apps + Devices > log out all sessions,")
+	outln("     rotate any bot/webhook tokens stored on this PC.")
+	outln("  3. Browsers: revoke sessions (Google/Facebook/etc. device lists),")
+	outln("     rotate payment cards if autofill was enabled.")
+	outln("  4. Crypto: move funds to a fresh wallet created on a CLEAN device;")
+	outln("     treat any seed/extension data on this PC as compromised.")
+	outln("  5. Minecraft: change Mojang/Microsoft password, invalidate session")
+	outln("     tokens, check .minecraft/servers.dat + launcher_accounts.json.")
+	outln("  6. SSH/FTP keys, .env files, FileZilla/WinSCP/PuTTY creds: rotate all.")
+	outln("  7. Reboot, then re-run this tool with --scan-only to verify clean.")
+	outln("==================================================================")
 }
 
 func main() {
 	flag.Parse()
-	fmt.Printf("MRT v%s — multi-family malware removal (Windows, Go, YARA-guided)\n", toolVersion)
-	fmt.Printf("Families: SilentNet | WeedHack/Majanito | WXSGrabber | Donki | destructive hashes (WannaCry/NotPetya/Stuxnet)\n")
-	fmt.Printf("SilentNet C2: %s | weedhack C2 rotates via ETH %s | donki C2 resolves via ETH %s\n",
+	initLogFile()
+	defer closeLogFile()
+	outf("MRT v%s — multi-family malware removal (Windows, Go, YARA-guided)", toolVersion)
+	outf("Families: SilentNet | WeedHack/Majanito | WXSGrabber | Donki | destructive hashes (WannaCry/NotPetya/Stuxnet) | generic heuristics")
+	outf("SilentNet C2: %s | weedhack C2 rotates via ETH %s | donki C2 resolves via ETH %s",
 		strings.Join(c2Domains, ", "), weedhackContract, donkiContract)
 
 	loadYaraLiterals()
 
 	if *fListLaunchers {
-		fmt.Println("Known game launchers (mod/instance coverage):")
+		outln("Known game launchers (mod/instance coverage):")
 		for _, l := range knownGameLaunchers() {
 			status := "not installed"
 			for _, p := range l.Paths {
@@ -2782,13 +2877,13 @@ func main() {
 					break
 				}
 			}
-			fmt.Printf("  [%-13s] %s\n", status, l.Name)
+			outf("  [%-13s] %s\n", status, l.Name)
 			for _, p := range l.Paths {
 				mark := " "
 				if dirExists(expandPathEnv(p)) {
 					mark = "+"
 				}
-				fmt.Printf("   %s %s\n", mark, expandPathEnv(p))
+				outf("   %s %s\n", mark, expandPathEnv(p))
 			}
 		}
 		return
@@ -2878,10 +2973,10 @@ func main() {
 
 	if *fScanOnly {
 		if confirmed+suspicious+boolToInt(stagingPresent)+boolToInt(pipePresent)+boolToInt(donkiSecPresent)+boolToInt(donkiStagePresent)+boolToInt(donkiPipePresent)+liveTargets > 0 {
-			fmt.Println("RESULT: indicators found (see above). Re-run without --scan-only --yes to remove.")
+			outln("RESULT: indicators found (see above). Re-run without --scan-only --yes to remove.")
 			os.Exit(1)
 		}
-		fmt.Println("RESULT: no malware indicators found.")
+		outln("RESULT: no malware indicators found.")
 		return
 	}
 
@@ -2974,21 +3069,21 @@ func main() {
 			stillLive++
 		}
 	}
-	fmt.Println()
-	fmt.Println("==================== VERIFY ====================")
-	fmt.Printf("staging removed: %v (was present: %v)\n", !stillStaging && stagingOK, stagingPresent)
-	fmt.Printf("pipe gone:       %v (was present: %v)\n", !stillPipe, pipePresent)
-	fmt.Printf("sys-cache gone:  %v | jvmtp DLLs gone: %v\n", !stillSysCache, !stillJvmtp)
-	fmt.Printf("donki sec gone:  %v (was present: %v) | donki_staging gone: %v | abe pipe gone: %v | sqlite drop gone: %v\n",
+	outln()
+	outln("==================== VERIFY ====================")
+	outf("staging removed: %v (was present: %v)\n", !stillStaging && stagingOK, stagingPresent)
+	outf("pipe gone:       %v (was present: %v)\n", !stillPipe, pipePresent)
+	outf("sys-cache gone:  %v | jvmtp DLLs gone: %v\n", !stillSysCache, !stillJvmtp)
+	outf("donki sec gone:  %v (was present: %v) | donki_staging gone: %v | abe pipe gone: %v | sqlite drop gone: %v\n",
 		!stillDonkiSec, donkiSecPresent, !stillDonkiStage, !stillDonkiPipe, !stillDonkiSqlite)
-	fmt.Printf("live procs left: %d (killed: %d)\n", stillLive, killed)
-	fmt.Printf("droppers handled: %d | spawn logs: %d | weedhack natives: %d | wxs: %d | donki: %d | wannacry svc: %d | registry: %d | tasks: %d | startup: %d\n",
+	outf("live procs left: %d (killed: %d)\n", stillLive, killed)
+	outf("droppers handled: %d | spawn logs: %d | weedhack natives: %d | wxs: %d | donki: %d | wannacry svc: %d | registry: %d | tasks: %d | startup: %d\n",
 		handled, nLogs, nWeed, nWXS, nDonki, nWcry, nReg, nTasks, nStartup)
 	if !stillStaging && !stillPipe && !stillSysCache && !stillJvmtp && !stillDonkiSec && !stillDonkiStage && !stillDonkiPipe && !stillDonkiSqlite && stillLive == 0 {
-		fmt.Println("RESULT: malware appears REMOVED from this host.")
+		outln("RESULT: malware appears REMOVED from this host.")
 	} else {
-		fmt.Println("RESULT: INCOMPLETE — reboot into Safe Mode, re-run as admin with --yes,")
-		fmt.Println("        then re-run --scan-only. Do not restore quarantined files.")
+		outln("RESULT: INCOMPLETE — reboot into Safe Mode, re-run as admin with --yes,")
+		outln("        then re-run --scan-only. Do not restore quarantined files.")
 	}
 	printPostRemovalChecklist(families)
 
