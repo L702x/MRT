@@ -1,6 +1,8 @@
 # MRT
 ![License: AGPL v3](https://img.shields.io/badge/License-AGPLv3-blue.svg)
+
 Just a tool that was made to help people remove malware from their devices.
+
 > [!NOTE]
 > This is mainly made with AI
 
