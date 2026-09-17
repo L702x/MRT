@@ -1,1 +1,1 @@
-go build -ldflags="-s -w" -trimpath -v -x -o mrt.exe .
+go build -ldflags="-s -w" -trimpath -v -x -o build/mrt.exe .
