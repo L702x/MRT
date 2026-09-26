@@ -8,6 +8,7 @@ import (
 	"embed"
 	"encoding/csv"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -60,14 +61,17 @@ var (
 	fYes          = flag.Bool("yes", false, "Skip confirmation prompt (required for non-interactive removal)")
 	fDryRun       = flag.Bool("dry-run", false, "Print what would be done without changing anything")
 	fVerbose      = flag.Bool("verbose", false, "Verbose output (per-file scores, skipped dirs)")
+	fVerboseShort = flag.Bool("v", false, "Shorthand for --verbose")
 	fQuarantine   = flag.String("quarantine-dir", "", "Quarantine directory (default %LOCALAPPDATA%\\MRT\\quarantine)")
 	fExtraPath    = flag.String("extra-path", "", "Comma-separated extra paths to scan (e.g. for testing against sample dirs)")
 	fDelete       = flag.Bool("delete", false, "Permanently delete droppers instead of quarantining (staging dir is always deleted)")
 	fNoHarden     = flag.Bool("no-harden", false, "Skip hosts/firewall hardening")
 	fYaraPath     = flag.String("yara-rules", "", "Single .yar file override (default: embedded rules plus every rules/*.yar next to the exe)")
 	fRoots        = flag.String("roots", "", "Comma-separated scan roots override (default: common places). Use for fast targeted scans, e.g. --roots \"C:\\samples\"")
+	fExclude      = flag.String("exclude", "", "Comma-separated path prefixes to skip during scanning (e.g. RE toolkits that trip heuristics). Narrow paths only - malware inside excluded dirs will be missed")
 	fAllowSampleDir = flag.Bool("allow-sample-dir", false, "Allow quarantine/delete inside the C:\\MALWARE research collection (default: refuse; scan-only still works)")
 	fListLaunchers = flag.Bool("list-launchers", false, "List known game launchers and which ones are installed, then exit")
+	fNoProgress = flag.Bool("no-progress", false, "Do not show the CLI progress bar during scans")
 )
 
 func logf(format string, a ...any) {
@@ -210,6 +214,17 @@ func sha256File(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// fillFindingSHA hashes lazily for hits only. Clean files (the 99%
+// majority) never pay for a full-file re-read + SHA256.
+func fillFindingSHA(f *finding) {
+	if f == nil || f.Verdict == "clean" || f.SHA256 != "" {
+		return
+	}
+	if h, err := sha256File(f.Path); err == nil {
+		f.SHA256 = h
+	}
+}
+
 func runCmd(name string, args ...string) (string, int) {
 	cmd := exec.Command(name, args...)
 	var buf bytes.Buffer
@@ -274,6 +289,76 @@ var embeddedStage2Markers = []string{
 
 var yaraLiterals []string
 var yaraRulesByFamily = map[string]string{}
+
+// ---- perf: precomputed raw-marker cache ----
+// scoreRawFamily used to rebuild the marker list per file and, per marker,
+// allocate []byte(m) + ToLower copy + utf16LE copy while scanning the file
+// 2-3x (up to ~200 markers x 16MB x 2-3 passes). We dedupe once and store
+// lower + wide forms so each file costs 1 lower scan (+1 wide scan on miss)
+// with zero per-marker allocs.
+type rawMarker struct {
+	orig  string
+	lower []byte
+	wide  []byte
+}
+
+var rawMarkerCache []rawMarker
+var rawMarkerCacheYaraLen = -1
+
+func buildRawMarkerCache() {
+	seen := make(map[string]bool, 256)
+	var uniq []string
+	addList := func(list ...string) {
+		for _, m := range list {
+			if m == "" || len(m) < 4 {
+				continue
+			}
+			if !seen[m] {
+				seen[m] = true
+				uniq = append(uniq, m)
+			}
+		}
+	}
+	addList(embeddedCleanMarkers...)
+	addList(embeddedStage2Markers...)
+	addList(weedhackStrong...)
+	addList(weedhackSupport...)
+	addList(wxsStrong...)
+	addList(donkiStrong...)
+	addList(donkiSupport...)
+	addList(yaraLiterals...)
+	rawMarkerCache = rawMarkerCache[:0]
+	for _, m := range uniq {
+		lo := strings.ToLower(m)
+		rawMarkerCache = append(rawMarkerCache, rawMarker{
+			orig:  m,
+			lower: []byte(lo),
+			wide:  utf16LE(m),
+		})
+	}
+	rawMarkerCacheYaraLen = len(yaraLiterals)
+}
+
+func ensureRawMarkerCache() {
+	if rawMarkerCache == nil || rawMarkerCacheYaraLen != len(yaraLiterals) {
+		buildRawMarkerCache()
+	}
+}
+
+// matchRawMarkers scans lower once per unique marker; wide is only checked
+// on a lower miss. Semantics match the old double-Contains for ASCII
+// markers (lower scan subsumes the exact-case scan).
+func matchRawMarkers(data, lower []byte) map[string]bool {
+	hits := make(map[string]bool, 8)
+	for _, e := range rawMarkerCache {
+		if bytes.Contains(lower, e.lower) {
+			hits[e.orig] = true
+		} else if len(e.wide) > 0 && bytes.Contains(data, e.wide) {
+			hits[e.orig] = true
+		}
+	}
+	return hits
+}
 
 var reYaraStringDef = regexp.MustCompile(`(?m)^\s*\$[A-Za-z0-9_]+\s*=\s*"((?:[^"\\]|\\.)+)"`)
 
@@ -389,6 +474,7 @@ func loadYaraLiterals() {
 		n := appendYaraLiterals(data, seen)
 		logf("[yara] loaded %d string literals from 1 rule file(s) (--yara-rules override)", len(yaraLiterals))
 		vlogf("[yara] %d literals from %s", n, *fYaraPath)
+		buildRawMarkerCache()
 		return
 	}
 	nEmbedded := loadEmbeddedYara(seen)
@@ -409,9 +495,11 @@ func loadYaraLiterals() {
 	}
 	if nEmbedded+nDisk == 0 {
 		vlogf("no embedded or on-disk .yar rules found; using built-in literals")
+		buildRawMarkerCache()
 		return
 	}
 	logf("[yara] loaded %d string literals from %d embedded + %d on-disk rule file(s)", len(yaraLiterals), nEmbedded, nDisk)
+	buildRawMarkerCache()
 }
 
 func externalYara() string {
@@ -441,6 +529,120 @@ func confirmWithExternalYara(yaraBin, rules, file string) []string {
 	return names
 }
 
+// sigResult is one row of the Authenticode batch query below.
+type sigResult struct {
+	Status string `json:"status"`
+	Signer string `json:"signer"`
+}
+
+// authenticodeSigners returns signer subjects for the subset of paths with
+// a Valid Authenticode signature. One batched powershell call per ~100
+// paths, 60s cap, fail-open: any error yields an empty map (no skipping).
+func authenticodeSigners(paths []string) map[string]string {
+	out := map[string]string{}
+	if runtime.GOOS != "windows" || len(paths) == 0 {
+		return out
+	}
+	if _, err := exec.LookPath("powershell"); err != nil {
+		return out
+	}
+	const batch = 100
+	for i := 0; i < len(paths); i += batch {
+		end := i + batch
+		if end > len(paths) {
+			end = len(paths)
+		}
+		chunk := paths[i:end]
+		var sb strings.Builder
+		sb.WriteString("$ps=@(")
+		for j, p := range chunk {
+			if j > 0 {
+				sb.WriteString(",")
+			}
+			sb.WriteString("'")
+			sb.WriteString(strings.ReplaceAll(p, "'", "''"))
+			sb.WriteString("'")
+		}
+		sb.WriteString("); Get-AuthenticodeSignature -LiteralPath $ps | ForEach-Object { [pscustomobject]@{status=\"$($_.Status)\"; signer=$(if ($_.SignerCertificate) { $_.SignerCertificate.Subject } else { '' })} } | ConvertTo-Json -Compress")
+		cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", sb.String())
+		var buf bytes.Buffer
+		cmd.Stdout = &buf
+		cmd.Stderr = &buf
+		if err := cmd.Start(); err != nil {
+			continue
+		}
+		timer := time.AfterFunc(60*time.Second, func() { _ = cmd.Process.Kill() })
+		_ = cmd.Wait()
+		timer.Stop()
+		raw := bytes.TrimSpace(buf.Bytes())
+		if len(raw) == 0 {
+			continue
+		}
+		// Single object vs array: normalize to array.
+		if !bytes.HasPrefix(raw, []byte("[")) {
+			raw = append([]byte("["), append(raw, ']', ')')...)
+		}
+		var rows []sigResult
+		if err := json.Unmarshal(raw, &rows); err != nil || len(rows) != len(chunk) {
+			continue
+		}
+		for k, r := range rows {
+			if r.Status == "Valid" {
+				out[chunk[k]] = shortSigner(r.Signer)
+			}
+		}
+	}
+	return out
+}
+
+// shortSigner compresses "CN=Hex-Rays SA, O=Hex-Rays SA, ..." to the CN.
+func shortSigner(subject string) string {
+	subject = strings.TrimSpace(subject)
+	if subject == "" {
+		return "unknown signer"
+	}
+	for _, part := range strings.Split(subject, ",") {
+		if kv := strings.SplitN(strings.TrimSpace(part), "=", 2); len(kv) == 2 && strings.EqualFold(kv[0], "CN") {
+			return strings.TrimSpace(kv[1])
+		}
+	}
+	if len(subject) > 64 {
+		return subject[:64]
+	}
+	return subject
+}
+
+// filterSignedGeneric drops generic-heuristic findings for files carrying a
+// valid Authenticode signature (IDA, Windows components, ...). Family
+// verdicts built on exact hashes or operator pivots are never overruled by
+// a signature - stolen certs exist (Stuxnet was signed too).
+func filterSignedGeneric(in []finding) []finding {
+	var cands []string
+	for _, f := range in {
+		if f.Family == "generic" {
+			cands = append(cands, f.Path)
+		}
+	}
+	if len(cands) == 0 {
+		return in
+	}
+	valid := authenticodeSigners(cands)
+	if len(valid) == 0 {
+		return in
+	}
+	out := make([]finding, 0, len(in))
+	for _, f := range in {
+		if f.Family == "generic" {
+			if signer, ok := valid[f.Path]; ok {
+				logf("[sigcheck] skipping %s: valid Authenticode signature (%s)", f.Path, signer)
+				continue
+			}
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
 type finding struct {
 	Path      string
 	Kind      string
@@ -459,6 +661,39 @@ func isSampleCollection(p string) bool {
 	return up == `C:\MALWARE` || strings.HasPrefix(up, `C:\MALWARE\`)
 }
 
+// excludedPrefixes parses --exclude into cleaned, lowercase path prefixes.
+func excludedPrefixes() []string {
+	if fExclude == nil || *fExclude == "" {
+		return nil
+	}
+	var out []string
+	for _, p := range strings.Split(*fExclude, ",") {
+		p = strings.TrimSpace(strings.Trim(p, `"`))
+		if p == "" {
+			continue
+		}
+		out = append(out, strings.ToLower(filepath.Clean(expandPathEnv(p))))
+	}
+	return out
+}
+
+// isExcluded reports whether p lies inside any --exclude prefix. Matches on
+// separator boundaries so excluding C:\tools\IDA does not also exclude
+// C:\tools\IDA2.
+func isExcluded(p string) bool {
+	prefixes := excludedPrefixes()
+	if len(prefixes) == 0 {
+		return false
+	}
+	lp := strings.ToLower(filepath.Clean(p))
+	for _, pre := range prefixes {
+		if lp == pre || strings.HasPrefix(lp, pre+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
 var reAssetBlob = regexp.MustCompile(`^assets/[a-z]{8}\.(bin|cache|dat|cfg|png)$`)
 
 func scoreJar(path string) finding {
@@ -468,9 +703,7 @@ func scoreJar(path string) finding {
 		return f
 	}
 	f.Size = st.Size()
-	if h, err := sha256File(path); err == nil {
-		f.SHA256 = h
-	}
+	// perf: SHA deferred to fillFindingSHA (hits only).
 
 	zr, err := zip.OpenReader(path)
 	if err != nil {
@@ -682,9 +915,7 @@ func scoreWeedHackJar(path string) finding {
 		return f
 	}
 	f.Size = st.Size()
-	if h, err := sha256File(path); err == nil {
-		f.SHA256 = h
-	}
+	// perf: SHA deferred to fillFindingSHA (hits only).
 	zr, err := zip.OpenReader(path)
 	if err != nil {
 		f.Verdict = "clean"
@@ -923,9 +1154,7 @@ func scoreWXSJar(path string) finding {
 		return f
 	}
 	f.Size = st.Size()
-	if h, err := sha256File(path); err == nil {
-		f.SHA256 = h
-	}
+	// perf: SHA deferred to fillFindingSHA (hits only).
 	zr, err := zip.OpenReader(path)
 	if err != nil {
 		f.Verdict = "clean"
@@ -1138,14 +1367,17 @@ func scoreDonkiJar(path string) finding {
 		return f
 	}
 	f.Size = st.Size()
-	if h, err := sha256File(path); err == nil {
-		f.SHA256 = h
-
-		if strings.EqualFold(h, donkiModuleSHA256) {
-			f.Score = 10
-			f.Verdict = "CONFIRMED"
-			f.Reasons = []string{"SHA256 matches curated Donki Module.jar (6770148 B)", "com/example infostealer + ABE bypass; see Module_writeup.md"}
-			return f
+	// perf: curated SHA match is size-gated — hashing every jar to compare
+	// against one hash cost a full re-read per file. Module.jar is 6770148 B.
+	if f.Size == 6770148 {
+		if h, err := sha256File(path); err == nil {
+			f.SHA256 = h
+			if strings.EqualFold(h, donkiModuleSHA256) {
+				f.Score = 10
+				f.Verdict = "CONFIRMED"
+				f.Reasons = []string{"SHA256 matches curated Donki Module.jar (6770148 B)", "com/example infostealer + ABE bypass; see Module_writeup.md"}
+				return f
+			}
 		}
 	}
 	zr, err := zip.OpenReader(path)
@@ -1328,8 +1560,628 @@ func scoreDonkiJar(path string) finding {
 	return f
 }
 
+func hasNonASCIIManifestBytes(data []byte) bool {
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "Main-Class:") {
+			for _, r := range line {
+				if r > 127 {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// scoreJarAllShared opens + inflates each jar ONCE instead of 5x (the old
+// code ran scoreJar/scoreWeedHackJar/scoreWXSJar/scoreDonkiJar/scoreGenericJar
+// sequentially, each re-opening the zip and re-deflating every .class entry).
+// One pass collects every family's metadata + content hits; verdict math
+// below is copied verbatim from the individual scorers.
 func scoreJarAll(path string) finding {
-	cands := []finding{scoreJar(path), scoreWeedHackJar(path), scoreWXSJar(path), scoreDonkiJar(path), scoreGenericJar(path)}
+	st, err := os.Stat(path)
+	if err != nil {
+		return finding{Path: path, Verdict: "clean"}
+	}
+	size := st.Size()
+
+	// Curated Donki fast path (size-gated so only 6770148 B files pay for it).
+	if size == 6770148 {
+		if h, err := sha256File(path); err == nil && strings.EqualFold(h, donkiModuleSHA256) {
+			return finding{
+				Path: path, Kind: "jar-donki", Family: "donki",
+				Score: 10, Verdict: "CONFIRMED",
+				Reasons: []string{"SHA256 matches curated Donki Module.jar (6770148 B)", "com/example infostealer + ABE bypass; see Module_writeup.md"},
+				SHA256: h, Size: size, YaraRules: yaraRulesByFamily["donki"],
+			}
+		}
+	}
+
+	zr, err := zip.OpenReader(path)
+	if err != nil {
+		return finding{Path: path, Verdict: "clean", Reasons: []string{"not a readable zip"}, Size: size}
+	}
+	defer zr.Close()
+
+	// Hoisted byte forms: one alloc per marker per jar instead of per entry.
+	toBlobs := func(list []string) [][]byte {
+		out := make([][]byte, 0, len(list))
+		for _, m := range list {
+			out = append(out, []byte(m))
+		}
+		return out
+	}
+	jdkBlobs := toBlobs([]string{"java/lang/ProcessBuilder", "createDirectories", "getenv", "ProcessBuilder$Redirect"})
+	plainBlobs := toBlobs(embeddedCleanMarkers)
+	weedStrongBlobs := toBlobs(weedhackStrong)
+	weedSupportBlobs := toBlobs(weedhackSupport)
+	wxsStrongBlobs := toBlobs(wxsStrong)
+	wxsSupportBlobs := toBlobs(wxsSupport)
+	donkiStrongBlobs := toBlobs(donkiStrong)
+	donkiSupportBlobs := toBlobs(donkiSupport)
+
+	containsAny := func(data []byte, blobs [][]byte, strs []string, hits map[string]bool) {
+		for i, b := range blobs {
+			if !hits[strs[i]] && bytes.Contains(data, b) {
+				hits[strs[i]] = true
+			}
+		}
+	}
+
+	// ---- metadata (no inflate except small files) ----
+	names := make(map[string]bool, len(zr.File))
+	var fabricData, manifestData []byte
+	hasFabric := false
+	// silentnet
+	hasLic, hasIcon := false, false
+	var licSize, iconSize int64
+	var licHash, iconHash string
+	ghClasses := 0
+	largeBlob := ""
+	var largeBlobSize uint64
+	// weed
+	jnic, silentBlob, hasCfg, hasDevJnic := false, false, false, false
+	// wxs
+	wxsHasLic, wxsHasImpl := false, false
+	wxsNestedLibs := 0
+	// donki entry/lib hits computed after loop from names
+	// generic pool
+	var genericNames []string
+	var genericBlobs [][]byte
+	var genericTotal int64
+
+	for _, e := range zr.File {
+		name := e.Name
+		names[name] = true
+		genericNames = append(genericNames, name)
+		switch name {
+		case "LICENSE_github":
+			hasLic = true
+			licSize = int64(e.UncompressedSize64)
+		case "assets/package/icon.png":
+			hasIcon = true
+			iconSize = int64(e.UncompressedSize64)
+		case "fabric.mod.json":
+			hasFabric = true
+		case "LICENSE_wxsgrabber-mod":
+			wxsHasLic = true
+		}
+		if strings.HasPrefix(name, "com/github/") && strings.HasSuffix(name, ".class") {
+			ghClasses++
+		}
+		if reAssetBlob.MatchString(name) && e.UncompressedSize64 > 500*1024 {
+			largeBlob = name
+			largeBlobSize = e.UncompressedSize64
+		}
+		if reJnicDir.MatchString(name) {
+			jnic = true
+		}
+		if name == "assets/thread_silent.dat" {
+			silentBlob = true
+		}
+		if name == "cfg.json" {
+			hasCfg = true
+		}
+		if strings.HasPrefix(name, "dev/jnic/") {
+			hasDevJnic = true
+		}
+		if strings.Contains(name, "net/fabricmc/core/impl/") {
+			wxsHasImpl = true
+		}
+		lower := strings.ToLower(name)
+		if strings.Contains(lower, "jna") && strings.HasSuffix(lower, ".jar") {
+			wxsNestedLibs++
+		}
+		if strings.Contains(lower, "sqlite-jdbc") {
+			wxsNestedLibs++
+		}
+	}
+
+	// Small files inflated once.
+	for _, e := range zr.File {
+		switch e.Name {
+		case "fabric.mod.json":
+			if e.UncompressedSize64 > 0 {
+				if rc, err := e.Open(); err == nil {
+					fabricData, _ = io.ReadAll(io.LimitReader(rc, 8192))
+					rc.Close()
+				}
+			}
+		case "META-INF/MANIFEST.MF":
+			if e.UncompressedSize64 > 0 {
+				if rc, err := e.Open(); err == nil {
+					manifestData, _ = io.ReadAll(io.LimitReader(rc, 4096))
+					rc.Close()
+				}
+			}
+		case "LICENSE_github", "assets/package/icon.png":
+			if e.UncompressedSize64 > 0 && e.UncompressedSize64 < 1<<20 {
+				if rc, err := e.Open(); err == nil {
+					data, _ := io.ReadAll(io.LimitReader(rc, 1<<20))
+					rc.Close()
+					sum := sha256.Sum256(data)
+					hx := hex.EncodeToString(sum[:])
+					if e.Name == "LICENSE_github" {
+						licHash = hx
+					} else {
+						iconHash = hx
+					}
+				}
+			}
+		}
+	}
+	hasManifestMC := bytes.Contains(manifestData, []byte("Main-Class: com.github."))
+	hasManifestDonki := bytes.Contains(manifestData, []byte("Main-Class: com.example.Main"))
+	hasManifestStage2 := bytes.Contains(manifestData, []byte(donkiStage2Main))
+	weedManifestNonASCII := hasNonASCIIManifestBytes(manifestData)
+
+	// ---- content: ONE inflate per entry, all families checked together ----
+	jdkHits := map[string]bool{}
+	plainHits := map[string]bool{}
+	weedStrongHits := map[string]bool{}
+	weedSupportHits := map[string]bool{}
+	wxsStrongHits := map[string]bool{}
+	wxsSupportHits := map[string]bool{}
+	donkiStrongHits := map[string]bool{}
+	donkiSupportHits := map[string]bool{}
+
+	jdkStrs := []string{"java/lang/ProcessBuilder", "createDirectories", "getenv", "ProcessBuilder$Redirect"}
+	for _, e := range zr.File {
+		if e.FileInfo().IsDir() || e.UncompressedSize64 == 0 || e.UncompressedSize64 > genericJarEntryCap {
+			// Still may need class scan? No — class cap is also 2MB
+			// (genericJarEntryCap == 2MB), so oversized entries are
+			// skipped by every scorer. Continue.
+			continue
+		}
+		isClass := strings.HasSuffix(e.Name, ".class")
+		isWxsExtra := strings.HasSuffix(e.Name, ".ps1") || strings.HasSuffix(e.Name, ".json")
+		needClass := isClass
+		needWxs := isClass || isWxsExtra
+		needGeneric := genericTotal < genericJarPoolCap
+		if !needClass && !needWxs && !needGeneric {
+			continue
+		}
+		rc, err := e.Open()
+		if err != nil {
+			continue
+		}
+		data, _ := io.ReadAll(io.LimitReader(rc, genericJarEntryCap))
+		rc.Close()
+		if needGeneric {
+			genericBlobs = append(genericBlobs, data)
+			genericTotal += int64(len(data))
+		} else {
+			// wxs/class-only entry beyond generic cap: still need data
+			// for family checks, but don't double-count generic.
+		}
+		famData := data
+		if needClass {
+			for i, b := range jdkBlobs {
+				if !jdkHits[jdkStrs[i]] && bytes.Contains(famData, b) {
+					jdkHits[jdkStrs[i]] = true
+				}
+			}
+			containsAny(famData, plainBlobs, embeddedCleanMarkers, plainHits)
+			containsAny(famData, weedStrongBlobs, weedhackStrong, weedStrongHits)
+			if len(weedSupportHits) < len(weedhackSupport) {
+				containsAny(famData, weedSupportBlobs, weedhackSupport, weedSupportHits)
+			}
+			containsAny(famData, donkiStrongBlobs, donkiStrong, donkiStrongHits)
+			if len(donkiSupportHits) < len(donkiSupport) {
+				containsAny(famData, donkiSupportBlobs, donkiSupport, donkiSupportHits)
+			}
+		}
+		if needWxs {
+			containsAny(famData, wxsStrongBlobs, wxsStrong, wxsStrongHits)
+			containsAny(famData, wxsSupportBlobs, wxsSupport, wxsSupportHits)
+		}
+	}
+
+	// ---- verdicts (copied threshold math from each scorer) ----
+	// silentnet
+	silent := finding{Path: path, Kind: "jar-dropper", Family: "silentnet", Verdict: "clean", Size: size, YaraRules: yaraRulesByFamily["silentnet"]}
+	{
+		score := 0
+		var reasons []string
+		if hasLic && licSize == 7047 && strings.HasPrefix(licHash, licGithubSHA256Prefix) {
+			score += 3
+			reasons = append(reasons, "LICENSE_github 7047B known SilentNet hash")
+		} else if hasLic {
+			score += 1
+			reasons = append(reasons, "LICENSE_github present")
+		}
+		structAnchors := 0
+		if hasLic {
+			structAnchors++
+		}
+		if hasIcon {
+			structAnchors++
+		}
+		if largeBlob != "" {
+			structAnchors++
+		}
+		if hasFabric && isSilentNetFabric(fabricData) {
+			structAnchors++
+		}
+		if hasManifestMC {
+			structAnchors++
+		}
+		if structAnchors != 0 {
+			if hasIcon && iconSize == 252 && strings.HasPrefix(iconHash, iconSHA256Prefix) {
+				score += 3
+				reasons = append(reasons, "assets/package/icon.png 252B known SilentNet hash")
+			} else if hasIcon {
+				score += 1
+				reasons = append(reasons, "assets/package/icon.png present")
+			}
+			if hasFabric && isSilentNetFabric(fabricData) {
+				score += 2
+				reasons = append(reasons, "fabric.mod.json SilentNet template (package/sample)")
+			} else if hasFabric {
+				vlogf("%s: fabric.mod.json present but not SilentNet template", path)
+			}
+			if largeBlob != "" {
+				score += 3
+				reasons = append(reasons, fmt.Sprintf("encrypted payload blob %s (%d bytes)", largeBlob, largeBlobSize))
+			}
+			if ghClasses >= 6 {
+				score += 2
+				reasons = append(reasons, fmt.Sprintf("%d com/github/*.class obfuscated classes", ghClasses))
+			} else if ghClasses >= 3 {
+				score += 1
+				reasons = append(reasons, fmt.Sprintf("%d com/github/*.class", ghClasses))
+			}
+			if hasManifestMC {
+				score += 1
+				reasons = append(reasons, "MANIFEST Main-Class: com.github.<random>")
+			}
+			if len(jdkHits) >= 3 {
+				score += 2
+				reasons = append(reasons, "JDK stealer triple (ProcessBuilder+createDirectories+getenv)")
+			}
+			if len(plainHits) >= 2 {
+				score += 3
+				pnames := make([]string, 0, len(plainHits))
+				for k := range plainHits {
+					pnames = append(pnames, strconv_k(k))
+				}
+				sort.Strings(pnames)
+				reasons = append(reasons, "plaintext stage-1 markers: "+strings.Join(pnames, ", "))
+			} else if len(plainHits) == 1 {
+				score += 1
+				for k := range plainHits {
+					reasons = append(reasons, "plaintext marker: "+k)
+				}
+			}
+			silent.Score = score
+			silent.Reasons = reasons
+			switch {
+			case score >= 8:
+				silent.Verdict = "CONFIRMED"
+				silent.Kind = "jar-dropper"
+			case score >= 5:
+				silent.Verdict = "SUSPICIOUS"
+				silent.Kind = "jar-dropper"
+			}
+		}
+	}
+
+	// weedhack
+	weed := finding{Path: path, Kind: "jar-weedhack", Family: "weedhack", Verdict: "clean", Size: size, YaraRules: yaraRulesByFamily["weedhack"]}
+	{
+		score := 0
+		anchors := 0
+		var reasons []string
+		fabricLower := strings.ToLower(string(fabricData))
+		for _, id := range weedhackFabricIDs {
+			if strings.Contains(fabricLower, id) {
+				score += 3
+				anchors++
+				reasons = append(reasons, "WeedHack fabric mod id "+id)
+				break
+			}
+		}
+		if jnic {
+			score += 3
+			anchors++
+			reasons = append(reasons, "JNIC native/ payload dir (KrLoader-style native protection)")
+		}
+		if silentBlob {
+			score += 3
+			anchors++
+			reasons = append(reasons, "assets/thread_silent.dat encrypted blob (Prestige-style)")
+		}
+		if hasDevJnic {
+			score += 2
+			anchors++
+			reasons = append(reasons, "dev/jnic/ loader layer")
+		}
+		if hasCfg {
+			score += 1
+			reasons = append(reasons, "cfg.json buyer-UUID file")
+		}
+		if hasNonASCIIEntrypoint(fabricData) {
+			score += 2
+			reasons = append(reasons, "non-ASCII (mangled) Fabric entrypoint")
+		}
+		if weedManifestNonASCII {
+			score += 1
+			reasons = append(reasons, "non-ASCII (mangled) manifest Main-Class")
+		}
+		strongCapped := 0
+		for range weedStrongHits {
+			if strongCapped < 3 {
+				score += 2
+				strongCapped++
+			}
+		}
+		if len(weedStrongHits) > 0 {
+			pnames := make([]string, 0, len(weedStrongHits))
+			for k := range weedStrongHits {
+				pnames = append(pnames, strconv_k(k))
+			}
+			sort.Strings(pnames)
+			reasons = append(reasons, "operator pivots: "+strings.Join(pnames, ", "))
+		}
+		supportCapped := 0
+		for range weedSupportHits {
+			if supportCapped < 3 {
+				score += 1
+				supportCapped++
+			}
+		}
+		if len(weedSupportHits) > 0 {
+			pnames := make([]string, 0, len(weedSupportHits))
+			for k := range weedSupportHits {
+				pnames = append(pnames, k)
+			}
+			sort.Strings(pnames)
+			reasons = append(reasons, "support markers: "+strings.Join(pnames, ", "))
+		}
+		if !(anchors == 0 && len(weedStrongHits) < 2) {
+			weed.Score = score
+			weed.Reasons = reasons
+			switch {
+			case score >= 6:
+				weed.Verdict = "CONFIRMED"
+			case score >= 3:
+				weed.Verdict = "SUSPICIOUS"
+			}
+			if weed.Verdict != "CONFIRMED" {
+				convict := 0
+				for k := range weedStrongHits {
+					if k != "getText" {
+						convict++
+					}
+				}
+				if convict >= 2 {
+					weed.Verdict = "CONFIRMED"
+					weed.Reasons = append(weed.Reasons, "conviction: 2+ operator-unique pivots")
+				}
+			}
+		}
+	}
+
+	// wxsgrabber
+	wxs := finding{Path: path, Kind: "jar-wxsgrabber", Family: "wxsgrabber", Verdict: "clean", Size: size, YaraRules: yaraRulesByFamily["wxsgrabber"]}
+	{
+		score := 0
+		anchors := 0
+		var reasons []string
+		if wxsHasLic {
+			score += 4
+			anchors++
+			reasons = append(reasons, "LICENSE_wxsgrabber-mod (unique to WXSGrabber)")
+		}
+		if wxsHasImpl {
+			score += 3
+			anchors++
+			reasons = append(reasons, "net.fabricmc.core.impl entrypoint (masquerades as Fabric internals)")
+		}
+		if len(fabricData) > 0 && strings.Contains(string(fabricData), "my-mod") {
+			score += 1
+			reasons = append(reasons, "fabric mod id my-mod")
+		}
+		if wxsNestedLibs > 0 {
+			score += 1
+			reasons = append(reasons, "bundled JNA/SQLite data-theft libs")
+		}
+		n := 0
+		for range wxsStrongHits {
+			if n < 4 {
+				score += 2
+				n++
+			}
+		}
+		if len(wxsStrongHits) > 0 {
+			pnames := make([]string, 0, len(wxsStrongHits))
+			for k := range wxsStrongHits {
+				pnames = append(pnames, strconv_k(k))
+			}
+			sort.Strings(pnames)
+			reasons = append(reasons, "WXS markers: "+strings.Join(pnames, ", "))
+		}
+		n = 0
+		for range wxsSupportHits {
+			if n < 2 {
+				score += 1
+				n++
+			}
+		}
+		if len(wxsSupportHits) > 0 {
+			pnames := make([]string, 0, len(wxsSupportHits))
+			for k := range wxsSupportHits {
+				pnames = append(pnames, strconv_k(k))
+			}
+			sort.Strings(pnames)
+			reasons = append(reasons, "support: "+strings.Join(pnames, ", "))
+		}
+		if !(anchors == 0 && len(wxsStrongHits) < 3) {
+			wxs.Score = score
+			wxs.Reasons = reasons
+			switch {
+			case score >= 7:
+				wxs.Verdict = "CONFIRMED"
+			case score >= 4:
+				wxs.Verdict = "SUSPICIOUS"
+			}
+			if wxs.Verdict != "CONFIRMED" {
+				convict := 0
+				for k := range wxsStrongHits {
+					if k != "firebasedatabase" {
+						convict++
+					}
+				}
+				if convict >= 2 {
+					wxs.Verdict = "CONFIRMED"
+					wxs.Reasons = append(wxs.Reasons, "conviction: 2+ WXS-unique pivots")
+				}
+			}
+		}
+	}
+
+	// donki
+	donki := finding{Path: path, Kind: "jar-donki", Family: "donki", Verdict: "clean", Size: size, YaraRules: yaraRulesByFamily["donki"]}
+	{
+		entryHits := 0
+		for _, n := range donkiEntries {
+			if names[n] {
+				entryHits++
+			}
+		}
+		libHits := 0
+		for _, n := range donkiLibs {
+			if names[n] {
+				libHits++
+			}
+		}
+		score := 0
+		anchors := 0
+		var reasons []string
+		if entryHits >= 6 {
+			score += 3
+			anchors++
+			reasons = append(reasons, fmt.Sprintf("%d/13 Donki com/example stealer entries (JNIC-resistant)", entryHits))
+		} else if entryHits >= 3 {
+			score += 2
+			anchors++
+			reasons = append(reasons, fmt.Sprintf("%d/13 Donki com/example stealer entries", entryHits))
+		} else if entryHits >= 1 {
+			score += 1
+			reasons = append(reasons, fmt.Sprintf("%d Donki entry (weak alone — needs pivots)", entryHits))
+		}
+		if libHits >= 2 && entryHits >= 2 {
+			score += 2
+			anchors++
+			reasons = append(reasons, fmt.Sprintf("querz/JNA/okhttp lib combo (%d libs + %d entries)", libHits, entryHits))
+		} else if libHits >= 3 {
+			score += 1
+			reasons = append(reasons, "querz/JNA/okhttp lib combo (weak alone)")
+		}
+		if hasManifestDonki && entryHits >= 3 {
+			score += 2
+			anchors++
+			reasons = append(reasons, "manifest Main-Class: com.example.Main + stealer entries")
+		} else if hasManifestDonki && entryHits >= 1 {
+			score += 1
+			reasons = append(reasons, "manifest Main-Class: com.example.Main")
+		}
+		if hasManifestStage2 {
+			score += 3
+			anchors++
+			reasons = append(reasons, "manifest Main-Class: dev.majanito.security.Main (Donki stage-2)")
+		}
+		if strings.EqualFold(filepath.Base(path), "SecurityManager.jar") {
+			score += 1
+			reasons = append(reasons, "filename SecurityManager.jar (Donki stage-2 name)")
+		}
+		n := 0
+		for range donkiStrongHits {
+			if n < 4 {
+				score += 2
+				n++
+			}
+		}
+		if len(donkiStrongHits) > 0 {
+			snames := make([]string, 0, len(donkiStrongHits))
+			for k := range donkiStrongHits {
+				snames = append(snames, strconv_k(k))
+			}
+			sort.Strings(snames)
+			reasons = append(reasons, "Donki pivots: "+strings.Join(snames, ", "))
+		}
+		n = 0
+		for range donkiSupportHits {
+			if n < 3 {
+				score += 1
+				n++
+			}
+		}
+		if len(donkiSupportHits) > 0 {
+			snames := make([]string, 0, len(donkiSupportHits))
+			for k := range donkiSupportHits {
+				snames = append(snames, strconv_k(k))
+			}
+			sort.Strings(snames)
+			reasons = append(reasons, "support: "+strings.Join(snames, ", "))
+		}
+		if !(anchors == 0 && len(donkiStrongHits) < 2) {
+			donki.Score = score
+			donki.Reasons = reasons
+			switch {
+			case score >= 7:
+				donki.Verdict = "CONFIRMED"
+			case score >= 4:
+				donki.Verdict = "SUSPICIOUS"
+			}
+			if donki.Verdict != "CONFIRMED" {
+				_, hasContract := donkiStrongHits["0x9044f5762e43b23ba91d124b51a045f1b51da652"]
+				unique := 0
+				for k := range donkiStrongHits {
+					switch k {
+					case "0x1f1bd692", "/api/receive", "/files/jar/security", "/api/static/index.js",
+						"Initializing Donki", "donki_staging", "SecurityManager.jar",
+						"dev.majanito.security.Main", "abe_decrypt_", "app_bound_encrypted_key",
+						"donkiFileInfos", "X-Tracking-ID":
+						unique++
+					}
+				}
+				if (hasContract && len(donkiStrongHits) >= 2) || unique >= 2 {
+					donki.Verdict = "CONFIRMED"
+					donki.Reasons = append(donki.Reasons, "conviction: 2+ Donki-unique pivots")
+				}
+			}
+		}
+	}
+
+	// generic over names + decompressed entries (same caps as genericJarPool)
+	generic := finding{Path: path, Kind: "heuristic", Family: "generic", Verdict: "clean", Size: size, YaraRules: yaraRulesByFamily["generic"]}
+	{
+		pool := bytes.Join(append([][]byte{[]byte(strings.Join(genericNames, "\n"))}, genericBlobs...), []byte("\n"))
+		generic = scoreGenericPool(path, pool, size, "")
+	}
+
+	cands := []finding{silent, weed, wxs, donki, generic}
 	best := cands[0]
 	bestRank := verdictRank(best.Verdict)
 	for _, c := range cands[1:] {
@@ -1444,15 +2296,12 @@ func scoreRawFamily(path string) finding {
 		f.Reasons = append(f.Reasons, "skipped: >100MB")
 		return f
 	}
-	if h, err := sha256File(path); err == nil {
-		f.SHA256 = h
-	} else {
-		f.Reasons = append(f.Reasons, "unreadable: "+err.Error())
-		f.Verdict = "clean"
-		return f
-	}
+	// perf: no eager SHA256 here (it re-read the whole file up to 128MB for
+	// every clean file). SHA is filled lazily by fillFindingSHA for hits
+	// only; main.py exact-hash check below hashes just that rare case.
 	fh, err := os.Open(path)
 	if err != nil {
+		f.Reasons = append(f.Reasons, "unreadable: "+err.Error())
 		return f
 	}
 	defer fh.Close()
@@ -1460,26 +2309,24 @@ func scoreRawFamily(path string) finding {
 	const preRead = 2 << 20
 	head, _ := io.ReadAll(io.LimitReader(fh, preRead))
 	lowerHead := bytes.ToLower(head)
-	hasPrefilter := bytes.Contains(head, []byte("NtProfile")) ||
-		bytes.Contains(lowerHead, []byte("ntprofile")) ||
-		bytes.Contains(head, []byte("AppHost")) ||
-		bytes.Contains(head, []byte("apphost")) ||
-		bytes.Contains(head, []byte("spec_from_file_location")) ||
-		bytes.Contains(head, []byte("donki")) ||
+	// perf: lower-only prefilter (exact-case checks were redundant — a lower
+	// hit subsumes them for these ASCII anchors).
+	hasPrefilter := bytes.Contains(lowerHead, []byte("ntprofile")) ||
+		bytes.Contains(lowerHead, []byte("apphost")) ||
+		bytes.Contains(lowerHead, []byte("spec_from_file_location")) ||
 		bytes.Contains(lowerHead, []byte("donki")) ||
-		bytes.Contains(head, []byte("abe_decrypt_")) ||
-		bytes.Contains(head, []byte("SecurityManager")) ||
-		bytes.Contains(head, []byte("majanito")) ||
+		bytes.Contains(lowerHead, []byte("abe_decrypt_")) ||
+		bytes.Contains(lowerHead, []byte("securitymanager")) ||
 		bytes.Contains(lowerHead, []byte("majanito")) ||
-		bytes.Contains(head, []byte("0x9044")) ||
-		bytes.Contains(head, []byte("X-Tracking-ID")) ||
-		bytes.Contains(head, []byte("discord_desktop_core")) ||
-		bytes.Contains(head, []byte("app_bound_encrypted_key")) ||
-		bytes.Contains(head, []byte("dQw4w9WgXcQ")) ||
-		bytes.Contains(head, []byte("/api/receive"))
-	if !hasPrefilter && !strings.HasSuffix(strings.ToLower(path), "main.py") && !strings.Contains(strings.ToLower(path), "index.js") {
+		bytes.Contains(lowerHead, []byte("0x9044")) ||
+		bytes.Contains(lowerHead, []byte("x-tracking-id")) ||
+		bytes.Contains(lowerHead, []byte("discord_desktop_core")) ||
+		bytes.Contains(lowerHead, []byte("app_bound_encrypted_key")) ||
+		bytes.Contains(lowerHead, []byte("dqw4w9wgxcq")) ||
+		bytes.Contains(lowerHead, []byte("/api/receive"))
+	lowerPath := strings.ToLower(path)
+	if !hasPrefilter && !strings.HasSuffix(lowerPath, "main.py") && !strings.Contains(lowerPath, "index.js") {
 
-		lowerPath := strings.ToLower(path)
 		isPE := strings.HasSuffix(lowerPath, ".exe") || strings.HasSuffix(lowerPath, ".dll")
 		if isPE || f.Size > 8<<20 {
 			f.Score = 0
@@ -1497,32 +2344,18 @@ func scoreRawFamily(path string) finding {
 		data = head
 	}
 
-	markers := append(append([]string{}, embeddedCleanMarkers...), embeddedStage2Markers...)
-	markers = append(markers, weedhackStrong...)
-	markers = append(markers, weedhackSupport...)
-	markers = append(markers, wxsStrong...)
-	markers = append(markers, donkiStrong...)
-	markers = append(markers, donkiSupport...)
-
-	markers = append(markers, yaraLiterals...)
-
-	hits := map[string]bool{}
+	ensureRawMarkerCache()
 	lower := bytes.ToLower(data)
-	for _, m := range markers {
-		if m == "" || len(m) < 4 {
-			continue
-		}
-		if bytes.Contains(data, []byte(m)) || bytes.Contains(lower, bytes.ToLower([]byte(m))) {
-			hits[m] = true
-		} else {
+	hits := matchRawMarkers(data, lower)
 
-			w := utf16LE(m)
-			if len(w) > 0 && bytes.Contains(data, w) {
-				hits[m] = true
-			}
-		}
-	}
+	return finishRawFamily(path, f.Size, lowerPath, hits)
+}
 
+// finishRawFamily scores precomputed marker hits. Shared by scoreRawFamily
+// (single-file path) and scoreRaw (shared-buffer path) so verdicts stay
+// identical while the file is read + lowered only once.
+func finishRawFamily(path string, size int64, lowerPath string, hits map[string]bool) finding {
+	f := finding{Path: path, Kind: "exe-variant", Verdict: "clean", Size: size}
 	score := 0
 	var reasons []string
 	hasStaging := hits["NtProfileIndex"]
@@ -1539,13 +2372,23 @@ func scoreRawFamily(path string) finding {
 		}
 	}
 	weedSupport := 0
-	for _, k := range append(append([]string{}, weedhackStrong...), weedhackSupport...) {
+	for _, k := range weedhackStrong {
+		if hits[k] {
+			weedSupport++
+		}
+	}
+	for _, k := range weedhackSupport {
 		if hits[k] {
 			weedSupport++
 		}
 	}
 	donkiSupportN := 0
-	for _, k := range append(append([]string{}, donkiStrong...), donkiSupport...) {
+	for _, k := range donkiStrong {
+		if hits[k] {
+			donkiSupportN++
+		}
+	}
+	for _, k := range donkiSupport {
 		if hits[k] {
 			donkiSupportN++
 		}
@@ -1578,7 +2421,12 @@ func scoreRawFamily(path string) finding {
 	}
 	if weedSupport > 0 {
 		names := []string{}
-		for _, k := range append(append([]string{}, weedhackStrong...), weedhackSupport...) {
+		for _, k := range weedhackStrong {
+			if hits[k] {
+				names = append(names, strconv_k(k))
+			}
+		}
+		for _, k := range weedhackSupport {
 			if hits[k] {
 				names = append(names, strconv_k(k))
 			}
@@ -1588,7 +2436,12 @@ func scoreRawFamily(path string) finding {
 	}
 	if donkiSupportN > 0 {
 		names := []string{}
-		for _, k := range append(append([]string{}, donkiStrong...), donkiSupport...) {
+		for _, k := range donkiStrong {
+			if hits[k] {
+				names = append(names, strconv_k(k))
+			}
+		}
+		for _, k := range donkiSupport {
 			if hits[k] {
 				names = append(names, strconv_k(k))
 			}
@@ -1597,12 +2450,18 @@ func scoreRawFamily(path string) finding {
 		reasons = append(reasons, "Donki markers: "+strings.Join(names, ", "))
 	}
 
-	if strings.HasSuffix(strings.ToLower(path), "main.py") && f.SHA256 == mainPySHA256 {
-		score += 6
-		reasons = append(reasons, "exact AppHost/main.py hash match")
-		f.Kind = "stage2-file"
-		f.Family = "silentnet"
-		f.YaraRules = yaraRulesByFamily["silentnet"]
+	if strings.HasSuffix(lowerPath, "main.py") {
+		// perf: only main.py candidates pay for a full hash (rare).
+		if h, err := sha256File(path); err == nil {
+			f.SHA256 = h
+			if h == mainPySHA256 {
+				score += 6
+				reasons = append(reasons, "exact AppHost/main.py hash match")
+				f.Kind = "stage2-file"
+				f.Family = "silentnet"
+				f.YaraRules = yaraRulesByFamily["silentnet"]
+			}
+		}
 	}
 	_ = nPlain
 
@@ -1623,9 +2482,8 @@ func scoreRawFamily(path string) finding {
 		}
 	}
 
-	lowerPath := strings.ToLower(path)
-	isPE := strings.HasSuffix(lowerPath, ".exe") || strings.HasSuffix(lowerPath, ".dll")
-	if isPE {
+	lowerPathIsPE := strings.HasSuffix(lowerPath, ".exe") || strings.HasSuffix(lowerPath, ".dll")
+	if lowerPathIsPE {
 		if !(hasStaging && support >= 1) && support < 3 && weedSupport < 3 && donkiSupportN < 3 {
 			f.Score = 0
 			f.Verdict = "clean"
@@ -1858,6 +2716,9 @@ func collectCandidates(roots []string) []string {
 		if selfExe != "" && strings.ToLower(p) == selfExe {
 			return
 		}
+		if isExcluded(p) {
+			return
+		}
 
 		key := strings.ToLower(p)
 		mu.Lock()
@@ -1892,6 +2753,10 @@ func collectCandidates(roots []string) []string {
 				if d.IsDir() {
 					if p != root && shouldSkipDir(p) {
 						vlogf("skipping dir: %s", p)
+						return filepath.SkipDir
+					}
+					if p != root && isExcluded(p) {
+						vlogf("skipping excluded dir: %s", p)
 						return filepath.SkipDir
 					}
 					return nil
@@ -1955,15 +2820,23 @@ func scanFiles(files []string) []finding {
 		logf("[yara] using embedded engine with built-in literals")
 	}
 
-	numWorkers := runtime.NumCPU() * 2
-	if numWorkers < 4 {
-		numWorkers = 4
+	ensureRawMarkerCache()
+	// perf: NumCPU workers, not 2x. The old 2x oversubscription kept all
+	// cores pegged (the reported 97% CPU) with extra context switching and
+	// memory-bandwidth contention while each worker memscans up to 16MB.
+	// Single-read + cached markers already raised throughput, so fewer,
+	// better-fed workers finish sooner at lower %CPU.
+	numWorkers := runtime.NumCPU()
+	if numWorkers < 2 {
+		numWorkers = 2
 	}
-	if numWorkers > 16 {
-		numWorkers = 16
+	if numWorkers > 8 {
+		numWorkers = 8
 	}
 	jobs := make(chan string, len(files))
 	results := make(chan finding, len(files))
+	prog := startScanProgress(len(files))
+	defer prog.finish()
 	var wg sync.WaitGroup
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
@@ -1972,6 +2845,7 @@ func scanFiles(files []string) []finding {
 			for p := range jobs {
 
 				if hf := checkFileHash(p); hf.Verdict == "CONFIRMED" || hf.Verdict == "SUSPICIOUS" {
+					prog.tick()
 					results <- hf
 					continue
 				}
@@ -1990,9 +2864,12 @@ func scanFiles(files []string) []finding {
 				} else {
 					f = scoreRaw(p)
 				}
+				// perf: SHA was deferred in all scorers; hash hits only.
+				fillFindingSHA(&f)
 				if f.Verdict != "clean" && yaraBin != "" && f.YaraRules != "" {
 					f.YaraHits = confirmWithExternalYara(yaraBin, f.YaraRules, p)
 				}
+				prog.tick()
 				results <- f
 			}
 		}()
@@ -2858,6 +3735,9 @@ func printPostRemovalChecklist(families map[string]bool) {
 
 func main() {
 	flag.Parse()
+	if *fVerboseShort {
+		*fVerbose = true
+	}
 	initLogFile()
 	defer closeLogFile()
 	outf("MRT v%s — multi-family malware removal (Windows, Go, YARA-guided)", toolVersion)
@@ -2944,9 +3824,13 @@ func main() {
 	for _, r := range roots {
 		logf("         %s", r)
 	}
+	if excl := excludedPrefixes(); len(excl) > 0 {
+		logf("[scan] excluded (%d): %s", len(excl), strings.Join(excl, ", "))
+	}
 	files := collectCandidates(roots)
 	logf("[scan] candidate files: %d (.jar/.zip/.exe/.dll/scripts)", len(files))
 	findings := scanFiles(files)
+	findings = filterSignedGeneric(findings)
 
 	confirmed, suspicious := 0, 0
 	families := map[string]bool{}

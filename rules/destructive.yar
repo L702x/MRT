@@ -6,7 +6,7 @@
  */
 rule Destructive_WannaCry_Variant {
     meta:
-        author = "static analysis - WannaCry.exe"
+        author = "L702x"
         date = "2026-09-16"
         family = "destructive"
         description = "WannaCry ransomware: embedded .wnry names + propagation commands"
@@ -33,7 +33,7 @@ rule Destructive_WannaCry_Variant {
 
 rule Destructive_NotPetya_Variant {
     meta:
-        author = "static analysis - NotPetya.exe"
+        author = "L702x"
         date = "2026-09-16"
         family = "destructive"
         description = "NotPetya wiper: ransom text + CHKDSK masquerade + perfc marker"
