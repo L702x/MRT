@@ -2,3 +2,4 @@
 *.EXE
 mrt.log
 build/
+sign.ps1

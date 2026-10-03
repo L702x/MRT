@@ -23,7 +23,7 @@ import (
 	"time"
 )
 
-const toolVersion = "1.5.0"
+const toolVersion = "1.7.0"
 
 var (
 	c2Domains = []string{
@@ -2692,6 +2692,11 @@ func shouldSkipDir(path string) bool {
 	if strings.Contains(lp, "silentnetremover"+string(filepath.Separator)+"quarantine") {
 		return true
 	}
+	// Own transient plaintext: decrypted embedded rules materialized for
+	// the external `yara` binary (%TEMP%\mrt-yara-*). Never scan them.
+	if strings.Contains(lp, "mrt-yara-") {
+		return true
+	}
 	base := strings.ToLower(filepath.Base(path))
 	if skipDirNames[base] {
 		return true
@@ -2706,14 +2711,15 @@ func collectCandidates(roots []string) []string {
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 8)
 
-	selfExe := ""
-	if exe, err := os.Executable(); err == nil {
-		selfExe = strings.ToLower(exe)
-
-	}
-
 	addFile := func(p string) {
-		if selfExe != "" && strings.ToLower(p) == selfExe {
+		// Never scan our own binary (path gate; the content-identity gate
+		// for renamed copies runs in the scan workers where hashing is
+		// affordable). Also skip our transient decrypted-rules temp dir.
+		if selfPathEqual(p) {
+			vlogf("skipping own binary: %s", p)
+			return
+		}
+		if embeddedYaraTempDir != "" && isInDir(p, embeddedYaraTempDir) {
 			return
 		}
 		if isExcluded(p) {
@@ -2843,7 +2849,13 @@ func scanFiles(files []string) []finding {
 		go func() {
 			defer wg.Done()
 			for p := range jobs {
-
+				// Own binary (including renamed copies): never a finding.
+				if isSelfBinary(p) {
+					vlogf("skipping own binary: %s", p)
+					prog.tick()
+					results <- finding{Path: p, Verdict: "clean"}
+					continue
+				}
 				if hf := checkFileHash(p); hf.Verdict == "CONFIRMED" || hf.Verdict == "SUSPICIOUS" {
 					prog.tick()
 					results <- hf
@@ -3038,6 +3050,9 @@ func killProcesses(procs []procInfo, dry bool) int {
 }
 
 func quarantineFile(path, quarantine string, f finding, dry bool) (string, error) {
+	if isSelfBinary(path) {
+		return "", fmt.Errorf("refusing to quarantine own binary %s", path)
+	}
 	if !*fAllowSampleDir && isSampleCollection(path) {
 		return "", fmt.Errorf("refusing to quarantine inside the C:\\MALWARE research collection (re-run with --allow-sample-dir to override)")
 	}
@@ -3879,6 +3894,10 @@ func main() {
 	handled := 0
 	for _, f := range findings {
 		if f.Verdict == "clean" {
+			continue
+		}
+		if isSelfBinary(f.Path) {
+			warnf("skipping %s: own binary (not malware)", f.Path)
 			continue
 		}
 		if !*fAllowSampleDir && isSampleCollection(f.Path) {
